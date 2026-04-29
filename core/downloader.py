@@ -24,8 +24,11 @@ from typing import Callable, Optional
 from core import version
 import zipfile
 import io
+import asyncio
+import aiohttp
+from concurrent.futures import ThreadPoolExecutor
 
-_BATCH_SIZE    = 2000   # safety cap (rarely hit given the size limit)
+_BATCH_SIZE    = 300   # safety cap (rarely hit given the size limit)
 _BATCH_MAX_MB  = 200    # ~10 batches total for a full 2GB install
 
 _FULLY_PRESERVE = [
@@ -85,6 +88,7 @@ class Downloader:
         on_done:     Optional[Callable] = None,
         on_error:    Optional[Callable] = None,
         repair_only: bool = False,
+        max_concurrent_batches=4,
     ):
         self.server_url  = server_url.rstrip("/")
         self.game_dir    = Path(game_dir)
@@ -95,6 +99,9 @@ class Downloader:
         self.on_error    = on_error    or (lambda m: None)
         self.repair_only = repair_only
         self._stop       = threading.Event()
+
+        self.max_concurrent = max_concurrent_batches
+        self._loop = None
 
     def stop(self):
         self._stop.set()
@@ -181,22 +188,25 @@ class Downloader:
 
         return bad
 
-    def _download_files(self, entries: list[dict], total_manifest: list[dict]):
+    def _download_files(self, entries, total_manifest):
         if not entries:
             self.on_status("Nothing to download.")
             return
         self.on_phase("downloading")
 
-        # Build a hash→entry lookup so we can find the dest path after extraction
-        hash_to_entry = {e["hash"]: e for e in entries}
+        # Build hash → entries (handles duplicates, as already fixed)
+        hash_to_entries = {}
+        for e in entries:
+            hash_to_entries.setdefault(e["hash"], []).append(e)
+
         total_bytes   = sum(e.get("size", 0) for e in entries)
         bytes_done    = 0
         files_done    = 0
         total_files   = len(entries)
 
-        # Split into batches
-        batches: list[list[dict]] = []
-        current:  list[dict]      = []
+        # Split into batches as before
+        batches = []
+        current = []
         current_mb = 0.0
         for e in entries:
             current.append(e)
@@ -208,38 +218,79 @@ class Downloader:
         if current:
             batches.append(current)
 
-        for batch_idx, batch in enumerate(batches):
-            if self._stop.is_set():
-                raise RuntimeError("Cancelled.")
-
-            hashes  = [e["hash"] for e in batch]
-            batch_n = f"{batch_idx+1}/{len(batches)}"
-            self.on_status(f"Downloading batch {batch_n} ({len(batch)} files)…")
-
-            req  = urllib.request.Request(
-                f"{self.server_url}/batch",
-                data=json.dumps({"hashes": hashes}).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST",
+        # We'll run async code inside a new event loop in this thread
+        loop = asyncio.new_event_loop()
+        self._loop = loop
+        try:
+            loop.run_until_complete(
+                self._async_download_batches(
+                    batches, hash_to_entries,
+                    total_bytes, total_files
+                )
             )
-            with urllib.request.urlopen(req, timeout=120) as r:
-                raw = r.read()
-
-            # Extract zip in-memory
-            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-                for name in zf.namelist():          # name == sha256 hash
-                    entry = hash_to_entry.get(name)
-                    if not entry:
-                        continue
-                    dest = self.game_dir / entry["path"]
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    dest.write_bytes(zf.read(name))
-                    sz = entry.get("size", 0)
-                    bytes_done += sz
-                    files_done += 1
-                    self.on_progress(files_done, total_files, bytes_done, total_bytes)
+        finally:
+            loop.close()
 
         self.on_status("Download complete.")
+
+    async def _async_download_batches(self, batches, hash_to_entries,
+                                    total_bytes, total_files):
+        semaphore = asyncio.Semaphore(self.max_concurrent)
+        session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=0))
+        lock = asyncio.Lock()
+        progress = {"bytes": 0, "files": 0}
+
+        async def download_one_batch(batch_idx, batch):
+            async with semaphore:
+                if self._stop.is_set():
+                    raise RuntimeError("Cancelled")
+
+                hashes = list({e["hash"] for e in batch})
+                batch_n = f"{batch_idx+1}/{len(batches)}"
+                self.on_status(f"Downloading batch {batch_n} ({len(batch)} files)…")
+
+                async with session.post(
+                    f"{self.server_url}/batch",
+                    json={"hashes": hashes},
+                    timeout=aiohttp.ClientTimeout(total=120)
+                ) as resp:
+                    raw = await resp.read()
+
+                # Run blocking extraction in a thread to keep the loop free
+                loop = asyncio.get_running_loop()
+                def process_zip():
+                    processed_bytes = 0
+                    processed_files = 0
+                    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                        for name in zf.namelist():
+                            entries_for_hash = hash_to_entries.get(name)
+                            if not entries_for_hash:
+                                continue
+                            data = zf.read(name)
+                            for entry in entries_for_hash:
+                                dest = self.game_dir / entry["path"]
+                                dest.parent.mkdir(parents=True, exist_ok=True)
+                                dest.write_bytes(data)
+                                processed_bytes += entry.get("size", 0)
+                                processed_files += 1
+                    return processed_bytes, processed_files
+
+                batch_bytes, batch_files = await loop.run_in_executor(None, process_zip)
+
+                # Update shared counters under lock
+                async with lock:
+                    progress["bytes"] += batch_bytes
+                    progress["files"] += batch_files
+                self.on_progress(progress["files"], total_files,
+                                progress["bytes"], total_bytes)
+
+        tasks = [download_one_batch(i, batch) for i, batch in enumerate(batches)]
+        try:
+            await asyncio.gather(*tasks)
+        except RuntimeError:
+            pass
+        finally:
+            await session.close()
 
 
     def _verify(self, manifest: list[dict]) -> list[dict]:
