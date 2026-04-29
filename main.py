@@ -16,9 +16,9 @@ from ui.app import run
 
 def main():
     parser = argparse.ArgumentParser(description="DWP Launcher")
-    parser.add_argument("--server", default="http://playdwp.net:5000",
+    parser.add_argument("--server", default="http://private.playdwp.net:5000",
                         help="Launcher server URL")
-    parser.add_argument("--dir",    default="./my_game_files",
+    parser.add_argument("--dir",    default="./content",
                         help="Game directory")
     args = parser.parse_args()
     run(args.server, args.dir)

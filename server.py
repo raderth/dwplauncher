@@ -17,6 +17,9 @@ import hashlib
 import argparse
 from pathlib import Path
 from flask import Flask, jsonify, send_file, abort
+import io
+import zipfile
+from flask import Flask, jsonify, send_file, abort, request
 
 app = Flask(__name__)
 
@@ -62,6 +65,32 @@ def manifest():
     """Return the full file manifest as JSON."""
     return jsonify(MANIFEST)
 
+@app.route("/batch", methods=["POST"])
+def batch():
+    """
+    POST body: {"hashes": ["abc123", "def456", ...]}
+    Returns a zip containing files named by their hash.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    hashes = body.get("hashes", [])
+    if not hashes:
+        abort(400, "No hashes requested")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for h in hashes:
+            path = HASH_TO_PATH.get(h)
+            if path and path.exists():
+                zf.write(path, arcname=h,
+                        compress_type=_compression_for(path.name),
+                        compresslevel=6)
+    buf.seek(0)
+    return send_file(buf, mimetype="application/zip", download_name="batch.zip")
+
+def _compression_for(name: str):
+    # Already-compressed formats — storing is faster than trying to compress
+    NO_COMPRESS = {".jar", ".zip", ".png", ".jpg", ".ogg", ".mp3"}
+    return zipfile.ZIP_STORED if Path(name).suffix.lower() in NO_COMPRESS else zipfile.ZIP_DEFLATED
 
 @app.route("/file/<sha256>")
 def serve_file(sha256: str):

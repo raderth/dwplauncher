@@ -22,6 +22,11 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
 from core import version
+import zipfile
+import io
+
+_BATCH_SIZE    = 2000   # safety cap (rarely hit given the size limit)
+_BATCH_MAX_MB  = 200    # ~10 batches total for a full 2GB install
 
 _FULLY_PRESERVE = [
     "saves",
@@ -181,26 +186,61 @@ class Downloader:
             self.on_status("Nothing to download.")
             return
         self.on_phase("downloading")
-        total_bytes = sum(e.get("size", 0) for e in entries)
-        bytes_done  = 0
 
-        for idx, entry in enumerate(entries):
+        # Build a hash→entry lookup so we can find the dest path after extraction
+        hash_to_entry = {e["hash"]: e for e in entries}
+        total_bytes   = sum(e.get("size", 0) for e in entries)
+        bytes_done    = 0
+        files_done    = 0
+        total_files   = len(entries)
+
+        # Split into batches
+        batches: list[list[dict]] = []
+        current:  list[dict]      = []
+        current_mb = 0.0
+        for e in entries:
+            current.append(e)
+            current_mb += e.get("size", 0) / 1_048_576
+            if len(current) >= _BATCH_SIZE or current_mb >= _BATCH_MAX_MB:
+                batches.append(current)
+                current = []
+                current_mb = 0.0
+        if current:
+            batches.append(current)
+
+        for batch_idx, batch in enumerate(batches):
             if self._stop.is_set():
                 raise RuntimeError("Cancelled.")
-            rel  = entry["path"]
-            dest = self.game_dir / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
 
-            url = f"{self.server_url}/file/{entry['hash']}"
-            self.on_status(f"Downloading [{idx+1}/{len(entries)}] {rel}")
+            hashes  = [e["hash"] for e in batch]
+            batch_n = f"{batch_idx+1}/{len(batches)}"
+            self.on_status(f"Downloading batch {batch_n} ({len(batch)} files)…")
 
-            with urllib.request.urlopen(url, timeout=60) as r:
-                data = r.read()
-            dest.write_bytes(data)
-            bytes_done += len(data)
-            self.on_progress(idx + 1, len(entries), bytes_done, total_bytes)
+            req  = urllib.request.Request(
+                f"{self.server_url}/batch",
+                data=json.dumps({"hashes": hashes}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=120) as r:
+                raw = r.read()
+
+            # Extract zip in-memory
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                for name in zf.namelist():          # name == sha256 hash
+                    entry = hash_to_entry.get(name)
+                    if not entry:
+                        continue
+                    dest = self.game_dir / entry["path"]
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(zf.read(name))
+                    sz = entry.get("size", 0)
+                    bytes_done += sz
+                    files_done += 1
+                    self.on_progress(files_done, total_files, bytes_done, total_bytes)
 
         self.on_status("Download complete.")
+
 
     def _verify(self, manifest: list[dict]) -> list[dict]:
         self.on_phase("verifying")

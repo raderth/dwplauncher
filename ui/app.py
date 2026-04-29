@@ -161,18 +161,11 @@ def _build_html(logo_data_uri: str) -> str:
 
   /* Logo: ring is a ::before pseudo, image canvas sits above it */
   #logo-ring {{
-    width: 120px; height: 120px; border-radius: 50%;
+    width: 120px; height: 120px;
     position: relative; margin-bottom: 20px; flex-shrink: 0;
   }}
-  #logo-ring::before {{
-    content: '';
-    position: absolute; inset: 0; border-radius: 50%;
-    border: 3px solid var(--green);
-    box-shadow: 0 0 0 1px rgba(58,176,74,0.3), 0 0 24px rgba(58,176,74,0.15);
-    z-index: 1; pointer-events: none;
-  }}
   #logo-canvas {{
-    position: absolute; inset: 0; border-radius: 50%; z-index: 2;
+    position: absolute; inset: 0; z-index: 2;
   }}
   #logo-text {{
     position: absolute; inset: 0;
@@ -604,7 +597,11 @@ function pyapi(action, ...args) {{
 // ── Play ──────────────────────────────────────────────────────────────────────
 function onPlayClick() {{
   if (btnState === 'idle' || btnState === 'error') pyapi('start_download');
-  else if (btnState === 'ready') pyapi('launch_game');
+  else if (btnState === 'ready') {{
+    setBtnState('launching', 'LAUNCHING', 'starting…', 100);
+    pyapi('launch_game');
+  }}
+  else if (btnState === 'running') pyapi('stop_game');
 }}
 
 function setBtnState(state, mainLabel, subLabel, progress) {{
@@ -613,7 +610,7 @@ function setBtnState(state, mainLabel, subLabel, progress) {{
   document.getElementById('btn-sub-label').textContent  = subLabel  || '';
   document.getElementById('btn-progress').style.width   = (progress || 0) + '%';
   document.getElementById('play-btn').disabled =
-    (state === 'downloading' || state === 'verifying');
+    (state === 'downloading' || state === 'verifying' || state === 'launching');
 }}
 
 function setStatus(msg)  {{ document.getElementById('status-label').textContent  = msg; }}
@@ -631,47 +628,8 @@ function renderLogo() {{
   const SIZE = 120;
   const canvas = document.getElementById('logo-canvas');
   const ctx = canvas.getContext('2d');
-  const off = document.createElement('canvas');
-  off.width = img.naturalWidth || SIZE;
-  off.height = img.naturalHeight || SIZE;
-  const octx = off.getContext('2d');
-  octx.drawImage(img, 0, 0);
-  const W = off.width, H = off.height;
-  try {{
-    const data = octx.getImageData(0, 0, W, H).data;
-    function isRowOpaque(y) {{
-      for (let x = 0; x < W; x++) if (data[(y * W + x) * 4 + 3] > 10) return true;
-      return false;
-    }}
-    function isColOpaque(x) {{
-      for (let y = 0; y < H; y++) if (data[(y * W + x) * 4 + 3] > 10) return true;
-      return false;
-    }}
-    let top = 0, bottom = H - 1, left = 0, right = W - 1;
-    while (top    < H && !isRowOpaque(top))    top++;
-    while (bottom > 0 && !isRowOpaque(bottom)) bottom--;
-    while (left   < W && !isColOpaque(left))   left++;
-    while (right  > 0 && !isColOpaque(right))  right--;
-    const srcW = right - left + 1, srcH = bottom - top + 1;
-    const side = Math.max(srcW, srcH);
-    const offX = left - Math.floor((side - srcW) / 2);
-    const offY = top  - Math.floor((side - srcH) / 2);
-    ctx.clearRect(0, 0, SIZE, SIZE);
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(SIZE / 2, SIZE / 2, SIZE / 2, 0, Math.PI * 2);
-    ctx.clip();
-    ctx.drawImage(off, offX, offY, side, side, 0, 0, SIZE, SIZE);
-    ctx.restore();
-  }} catch(e) {{
-    ctx.clearRect(0, 0, SIZE, SIZE);
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(SIZE / 2, SIZE / 2, SIZE / 2, 0, Math.PI * 2);
-    ctx.clip();
-    ctx.drawImage(img, 0, 0, SIZE, SIZE);
-    ctx.restore();
-  }}
+  ctx.clearRect(0, 0, SIZE, SIZE);
+  ctx.drawImage(img, 0, 0, SIZE, SIZE);
 }}
 
 // ── Mods ──────────────────────────────────────────────────────────────────────
@@ -851,6 +809,8 @@ class API:
         self._game_dir  = game_dir
         self._dl: Downloader | None = None
         self._btn_state = "idle"
+
+        self._process: subprocess.Popen | None = None
 
     @property
     def _win(self):
@@ -1033,7 +993,7 @@ class API:
         if re.fullmatch(r"\d+(?:\.\d+)*", dir_ver):
             mc_ver = dir_ver
         if not mc_ver:
-            mc_ver = "1.21.1"
+            mc_ver = "26.1.2"
 
         jvm_mb       = self._cfg.get("jvm_memory_mb") or config.default_jvm_mb()
         account      = self._cfg.get("active_account")
@@ -1050,7 +1010,7 @@ class API:
                 self._js("toast('Please verify your account first (Settings tab).')")
                 return
 
-        err = launch(
+        err, proc = launch(
             game_dir     = self._cfg["game_dir"],
             mc_version   = mc_ver,
             jvm_mb       = jvm_mb,
@@ -1060,7 +1020,26 @@ class API:
         )
         if err:
             self._js(f"toast({json.dumps(err)})")
+            self._js("setBtnState('ready','PLAY','',100)")
+            return
+        self._process = proc
+        self._js("setBtnState('running','STOP','Game running',100)")
+        threading.Thread(target=self._watch_process, daemon=True).start()
 
+    def _watch_process(self):
+        if self._process:
+            self._process.wait()          # blocks until game exits
+        self._process = None
+        self._btn_state = "ready"
+        self._js("setBtnState('ready','PLAY','',100)")
+        self._js("setStatus('Game closed.')")
+
+    def stop_game(self):
+        if self._process:
+            try:
+                self._process.terminate()
+            except Exception:
+                pass
     # ── Version check ───────────────────────────────────────────────────────
     def check_version(self):
         def work():
