@@ -1,0 +1,239 @@
+"""
+core/downloader.py  –  Download, verify and repair game files.
+
+FULLY PRESERVED (never touched):
+  saves/**, options.txt, servers.dat, screenshots/**, logs/**, crash-reports/**
+
+SYNC-ONLY (add missing, never delete or overwrite):
+  mods/**, resourcepacks/**, datapacks/**, shaderpacks/**
+  - A server mod is considered "present" if the .jar OR the .jar.disabled
+    version exists locally. This preserves the user's enabled/disabled toggle.
+  - User-added files that are NOT in the server manifest are left alone.
+  - Files that are in the manifest but missing entirely are downloaded.
+
+NORMAL (hash-verified, re-downloaded if wrong):
+  Everything else (game JARs, configs, libraries, assets, etc.)
+"""
+import hashlib
+import json
+import os
+import threading
+import urllib.request
+from pathlib import Path
+from typing import Callable, Optional
+from core import version
+
+_FULLY_PRESERVE = [
+    "saves",
+    "options.txt",
+    "servers.dat",
+    "screenshots",
+    "logs",
+    "crash-reports",
+]
+
+_SYNC_ONLY_DIRS = [
+    "mods",
+    "resourcepacks",
+    "datapacks",
+    "shaderpacks",
+]
+
+
+def _is_fully_preserved(rel_path: str) -> bool:
+    parts = Path(rel_path).parts
+    return any(parts[0] == g or rel_path == g for g in _FULLY_PRESERVE)
+
+
+def _is_sync_only(rel_path: str) -> bool:
+    parts = Path(rel_path).parts
+    return len(parts) > 0 and parts[0] in _SYNC_ONLY_DIRS
+
+
+def _sync_present(dest: Path) -> bool:
+    """
+    True if the file (or its .disabled / enabled counterpart) exists locally.
+    We don't check the hash — user may have a different version or toggled it.
+    """
+    if dest.exists():
+        return True
+    # enabled → check disabled variant
+    disabled = dest.parent / (dest.name + ".disabled")
+    if disabled.exists():
+        return True
+    # disabled → check enabled variant
+    if dest.name.endswith(".disabled"):
+        enabled = dest.parent / dest.name[: -len(".disabled")]
+        if enabled.exists():
+            return True
+    return False
+
+
+class Downloader:
+    def __init__(
+        self,
+        server_url: str,
+        game_dir:   str,
+        on_progress: Optional[Callable] = None,
+        on_status:   Optional[Callable] = None,
+        on_phase:    Optional[Callable] = None,
+        on_done:     Optional[Callable] = None,
+        on_error:    Optional[Callable] = None,
+        repair_only: bool = False,
+    ):
+        self.server_url  = server_url.rstrip("/")
+        self.game_dir    = Path(game_dir)
+        self.on_progress = on_progress or (lambda *a: None)
+        self.on_status   = on_status   or (lambda m: None)
+        self.on_phase    = on_phase    or (lambda p: None)
+        self.on_done     = on_done     or (lambda: None)
+        self.on_error    = on_error    or (lambda m: None)
+        self.repair_only = repair_only
+        self._stop       = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        try:
+            manifest = self._fetch_manifest()
+
+            if self.repair_only:
+                to_download = self._find_bad(manifest)
+            else:
+                to_download = self._find_missing_or_bad(manifest)
+
+            self._download_files(to_download, total_manifest=manifest)
+
+            # Verify only normal (non-sync-only, non-preserved) files
+            verify_set = [
+                e for e in manifest
+                if not _is_fully_preserved(e["path"]) and not _is_sync_only(e["path"])
+            ]
+            failed = self._verify(verify_set)
+            if failed:
+                self.on_status(f"Repairing {len(failed)} bad file(s)…")
+                self._download_files(failed, total_manifest=manifest)
+                still_bad = self._verify(verify_set)
+                if still_bad:
+                    raise RuntimeError(
+                        "Verification failed for: "
+                        + ", ".join(e["path"] for e in still_bad[:5])
+                    )
+
+            self._write_version()
+            self.on_phase("done")
+            self.on_done()
+        except Exception as exc:
+            self.on_phase("error")
+            self.on_error(str(exc))
+
+    def _fetch_manifest(self) -> list[dict]:
+        self.on_status("Fetching manifest…")
+        with urllib.request.urlopen(f"{self.server_url}/manifest", timeout=15) as r:
+            data = json.loads(r.read())
+        self.on_status(f"Manifest: {len(data)} files")
+        return data
+
+    def _find_missing_or_bad(self, manifest: list[dict]) -> list[dict]:
+        to_dl = []
+        for entry in manifest:
+            rel  = entry["path"]
+            dest = self.game_dir / rel
+
+            if _is_fully_preserved(rel):
+                continue
+
+            if _is_sync_only(rel):
+                # Only download if neither the enabled nor disabled copy exists
+                if not _sync_present(dest):
+                    to_dl.append(entry)
+                continue
+
+            # Normal file — download if missing or hash wrong
+            if not dest.exists() or self._hash_file(dest) != entry["hash"]:
+                to_dl.append(entry)
+
+        return to_dl
+
+    def _find_bad(self, manifest: list[dict]) -> list[dict]:
+        """Repair mode: same rules but also re-checks hash on normal files."""
+        bad = []
+        for entry in manifest:
+            rel  = entry["path"]
+            dest = self.game_dir / rel
+
+            if _is_fully_preserved(rel):
+                continue
+
+            if _is_sync_only(rel):
+                if not _sync_present(dest):
+                    bad.append(entry)
+                continue
+
+            if not dest.exists() or self._hash_file(dest) != entry["hash"]:
+                bad.append(entry)
+
+        return bad
+
+    def _download_files(self, entries: list[dict], total_manifest: list[dict]):
+        if not entries:
+            self.on_status("Nothing to download.")
+            return
+        self.on_phase("downloading")
+        total_bytes = sum(e.get("size", 0) for e in entries)
+        bytes_done  = 0
+
+        for idx, entry in enumerate(entries):
+            if self._stop.is_set():
+                raise RuntimeError("Cancelled.")
+            rel  = entry["path"]
+            dest = self.game_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+
+            url = f"{self.server_url}/file/{entry['hash']}"
+            self.on_status(f"Downloading [{idx+1}/{len(entries)}] {rel}")
+
+            with urllib.request.urlopen(url, timeout=60) as r:
+                data = r.read()
+            dest.write_bytes(data)
+            bytes_done += len(data)
+            self.on_progress(idx + 1, len(entries), bytes_done, total_bytes)
+
+        self.on_status("Download complete.")
+
+    def _verify(self, manifest: list[dict]) -> list[dict]:
+        self.on_phase("verifying")
+        bad   = []
+        total = len(manifest)
+        for idx, entry in enumerate(manifest):
+            if self._stop.is_set():
+                break
+            rel  = entry["path"]
+            dest = self.game_dir / rel
+            self.on_status(f"Verifying [{idx+1}/{total}] {rel}")
+            if not dest.exists() or self._hash_file(dest) != entry["hash"]:
+                bad.append(entry)
+            self.on_progress(idx + 1, total, idx + 1, total)
+        return bad
+
+    def _write_version(self):
+        try:
+            remote = version.server_version(self.server_url)
+            if remote and isinstance(remote, dict) and remote.get("version"):
+                data = dict(remote)
+                if not data.get("mc_version"):
+                    mc = version._infer_mc_version_from_dir(self.game_dir)
+                    if mc:
+                        data["mc_version"] = mc
+                version.write_version(str(self.game_dir), data)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _hash_file(path: Path) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
