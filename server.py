@@ -22,6 +22,8 @@ import sys
 import zipfile
 import argparse
 from pathlib import Path
+import tempfile
+import shutil
 
 from flask import Flask, Response, jsonify, send_file, abort, stream_with_context
 
@@ -35,6 +37,7 @@ MANIFEST:      list[dict]       = []   # [{hash, path, size}, …]
 HASH_TO_PATH:  dict[str, Path]  = {}   # sha256 → absolute Path
 CHUNKS:        list[dict]       = []   # [{id, hashes: [...]}]
 CHUNK_DATA:    dict[str, bytes] = {}   # chunk_id → raw zip bytes
+CHUNK_DIR: Path = None
 
 # Tuning — adjust to taste.
 _CHUNK_MAX_FILES = 300
@@ -59,16 +62,15 @@ def _compression_for(name: str) -> int:
             else zipfile.ZIP_DEFLATED)
 
 
-def _build_zip(hashes: list[str], hash_to_path: dict[str, Path]) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as zf:
+def _build_zip_to_disk(hashes: list[str], hash_to_path: dict[str, Path], dest: Path) -> None:
+    """Build a zip on disk."""
+    with zipfile.ZipFile(dest, "w") as zf:
         for h in hashes:
-            path = hash_to_path.get(h)      # ← use the passed parameter
+            path = hash_to_path.get(h)
             if path and path.exists():
                 zf.write(path, arcname=h,
                          compress_type=_compression_for(path.name),
                          compresslevel=6)
-    return buf.getvalue()
 
 
 # ── Startup indexing ──────────────────────────────────────────────────────────
@@ -80,6 +82,9 @@ def index_and_prebuild(base: Path) -> None:
     All globals are replaced atomically at the end so Flask never sees
     a half-initialised state if you ever call this again at runtime.
     """
+    global CHUNK_DIR
+    CHUNK_DIR = Path(tempfile.mkdtemp(prefix="mcchunks_"))
+    print(f"[server] Chunk cache: {CHUNK_DIR}")
     print(f"[server] Indexing '{base}' …", flush=True)
     manifest: list[dict]      = []
     hash_to_path: dict[str, Path] = {}
@@ -107,11 +112,10 @@ def index_and_prebuild(base: Path) -> None:
         if not current_hashes:
             return
         chunk_id = f"chunk_{len(chunks):04d}"
-        print(f"[server]   Building {chunk_id} "
-              f"({len(current_hashes)} files, {current_mb:.1f} MB) …", flush=True)
-        data = _build_zip(current_hashes, hash_to_path)
+        print(f"[server]   Building {chunk_id} …", flush=True)
+        dest_path = CHUNK_DIR / f"{chunk_id}.zip"
+        _build_zip_to_disk(current_hashes, hash_to_path, dest_path)
         chunks.append({"id": chunk_id, "hashes": list(current_hashes)})
-        chunk_data[chunk_id] = data
         current_hashes = []
         current_mb = 0.0
 
@@ -145,17 +149,10 @@ def manifest():
 
 @app.route("/chunk/<chunk_id>")
 def serve_chunk(chunk_id: str):
-    """Stream a pre-built zip chunk. Zero CPU on the hot path."""
-    data = CHUNK_DATA.get(chunk_id)
-    if data is None:
-        abort(404, description=f"No chunk '{chunk_id}'")
-    # Wrap in BytesIO so Flask can seek / send without copying.
-    return send_file(
-        io.BytesIO(data),
-        mimetype="application/zip",
-        download_name=f"{chunk_id}.zip",
-        etag=False,          # chunks are immutable; let clients cache by chunk_id
-    )
+    zip_path = CHUNK_DIR / f"{chunk_id}.zip"
+    if not zip_path.exists():
+        abort(404)
+    return send_file(zip_path, mimetype="application/zip")
 
 
 @app.route("/file/<sha256>")
