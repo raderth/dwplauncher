@@ -8,7 +8,8 @@ import platform
 from pathlib import Path
 
 DEFAULT_CONFIG = {
-    "server_url":    "http://playdwp.net:5000",
+    "server_url":    "http://playdwp.net",
+    "download_url": "http://playdwp.net:5000",
     "map_url":       "http://playdwp.net:8080",
     "game_dir":      "./my_game_files",
     "jvm_memory_mb": None,   # None = auto (50% RAM)

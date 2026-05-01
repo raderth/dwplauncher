@@ -508,6 +508,10 @@ def _build_html(logo_data_uri: str) -> str:
           <div class="settings-control">
             <input class="settings-input" type="text" id="server-url-input">
           </div>
+          <div class="settings-label">Download URL</div>
+          <div class="settings-control">
+            <input class="settings-input" type="text" id="download-url-input">
+          </div>
         </div>
       </div>
 
@@ -757,8 +761,9 @@ function doVerifyRepair() {{ showTab('play'); pyapi('start_repair'); }}
 // ── Save settings ─────────────────────────────────────────────────────────────
 function saveSettings() {{
   const serverUrl = document.getElementById('server-url-input').value.trim();
+  const downloadUrl = document.getElementById('download-url-input').value.trim();
   const memMb     = parseInt(document.getElementById('mem-slider').value);
-  const r = pyapi('save_settings', serverUrl, memMb);
+  const r = pyapi('save_settings', serverUrl, downloadUrl, memMb);
   if (r && r.then) r.then(() => toast('Settings saved.'));
   else toast('Settings saved.');
 }}
@@ -912,8 +917,9 @@ class API:
         return {"ok": False, "error": data.get("error", "Unknown error")}
 
     # ── Settings ───────────────────────────────────────────────────────────
-    def save_settings(self, server_url: str, mem_mb: int):
+    def save_settings(self, server_url: str, download_url: str, mem_mb: int):
         self._cfg["server_url"]    = server_url
+        self._cfg["download_url"]    = download_url
         self._cfg["jvm_memory_mb"] = int(mem_mb)
         config.save(self._cfg)
 
@@ -923,7 +929,7 @@ class API:
         if self._btn_state in ("downloading", "verifying"):
             return
         if not repair_only and version.mc_version_changed(
-                self._cfg["game_dir"], self._cfg["server_url"]):
+                self._cfg["game_dir"], self._cfg["download_url"]):
             import shutil
             mods_path = Path(self._cfg["game_dir"]) / "mods"
             if mods_path.exists():
@@ -1050,7 +1056,7 @@ class API:
     def check_version(self):
         def work():
             needs, local, remote = version.needs_update(
-                self._cfg["game_dir"], self._cfg["server_url"])
+                self._cfg["game_dir"], self._cfg["download_url"])
             if local == "none":
                 label, state, lbl = f"Not installed  |  Server: {remote}", "idle", "DOWNLOAD"
             elif needs:
