@@ -36,7 +36,6 @@ BASE_DIR: Path = Path(".")
 MANIFEST:      list[dict]       = []   # [{hash, path, size}, …]
 HASH_TO_PATH:  dict[str, Path]  = {}   # sha256 → absolute Path
 CHUNKS:        list[dict]       = []   # [{id, hashes: [...]}]
-CHUNK_DATA:    dict[str, bytes] = {}   # chunk_id → raw zip bytes
 CHUNK_DIR: Path = None
 
 # Tuning — adjust to taste.
@@ -102,7 +101,6 @@ def index_and_prebuild(base: Path) -> None:
 
     # ── Chunk splitting (same logic as downloader) ────────────────────────
     chunks: list[dict]        = []
-    chunk_data: dict[str, bytes] = {}
 
     current_hashes: list[str] = []
     current_mb = 0.0
@@ -131,7 +129,12 @@ def index_and_prebuild(base: Path) -> None:
     MANIFEST, HASH_TO_PATH, CHUNKS, CHUNK_DATA = \
         manifest, hash_to_path, chunks, chunk_data
 
-    total_zip_mb = sum(len(v) for v in chunk_data.values()) / 1_048_576
+    # Calculate total size from the ON-DISK zips, not from memory
+    total_zip_mb = sum(
+        (CHUNK_DIR / f"{c['id']}.zip").stat().st_size
+        for c in chunks
+    ) / 1_048_576
+
     print(f"[server] Ready — {len(manifest)} files in {len(chunks)} chunks "
           f"({total_zip_mb:.1f} MB pre-compressed)", flush=True)
 
