@@ -127,7 +127,7 @@ def index_and_prebuild(base: Path) -> None:
     # Atomic swap — Flask threads reading the old globals are unaffected.
     global MANIFEST, HASH_TO_PATH, CHUNKS, CHUNK_DATA
     MANIFEST, HASH_TO_PATH, CHUNKS, CHUNK_DATA = \
-        manifest, hash_to_path, chunks, chunk_data
+        manifest, hash_to_path, chunks
 
     # Calculate total size from the ON-DISK zips, not from memory
     total_zip_mb = sum(
