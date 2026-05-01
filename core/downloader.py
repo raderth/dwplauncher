@@ -18,6 +18,7 @@ import asyncio
 import hashlib
 import io
 import json
+import logging
 import threading
 import urllib.request
 import zipfile
@@ -29,13 +30,14 @@ import aiohttp
 
 from core import version
 
-# Maximum simultaneous chunk downloads.  4 is a safe default; bump to 6-8 on
-# fast LAN connections where the server isn't the bottleneck.
-_MAX_CONCURRENT = 4
+log = logging.getLogger(__name__)
 
-# How many files to hash in parallel during verify.
-# I/O-bound, so more threads than CPU cores is fine.
+_MAX_CONCURRENT = 4
 _VERIFY_WORKERS = 8
+
+# If more than this fraction of a chunk's files are needed, fetch the whole
+# chunk rather than repairing individual files.  0.3 = 30 %.
+_CHUNK_REPAIR_THRESHOLD = 0.30
 
 _FULLY_PRESERVE = [
     "saves", "options.txt", "servers.dat",
@@ -57,11 +59,9 @@ def _is_sync_only(rel_path: str) -> bool:
 
 
 def _sync_present(dest: Path) -> bool:
-    """True if the file or its .disabled counterpart exists locally."""
     if dest.exists():
         return True
-    disabled = dest.parent / (dest.name + ".disabled")
-    if disabled.exists():
+    if (dest.parent / (dest.name + ".disabled")).exists():
         return True
     if dest.name.endswith(".disabled"):
         enabled = dest.parent / dest.name[: -len(".disabled")]
@@ -75,45 +75,44 @@ def _sync_present(dest: Path) -> bool:
 class Downloader:
     def __init__(
         self,
-        server_url:           str,
-        game_dir:             str,
-        on_progress:          Optional[Callable] = None,
-        on_status:            Optional[Callable] = None,
-        on_phase:             Optional[Callable] = None,
-        on_done:              Optional[Callable] = None,
-        on_error:             Optional[Callable] = None,
-        repair_only:          bool = False,
-        max_concurrent_chunks: int = _MAX_CONCURRENT,
+        server_url:            str,
+        game_dir:              str,
+        on_progress:           Optional[Callable] = None,
+        on_status:             Optional[Callable] = None,
+        on_phase:              Optional[Callable] = None,
+        on_done:               Optional[Callable] = None,
+        on_error:              Optional[Callable] = None,
+        repair_only:           bool = False,
+        max_concurrent_chunks: int  = _MAX_CONCURRENT,
     ):
-        self.server_url   = server_url.rstrip("/")
-        self.game_dir     = Path(game_dir)
-        self.on_progress  = on_progress or (lambda *a: None)
-        self.on_status    = on_status   or (lambda m: None)
-        self.on_phase     = on_phase    or (lambda p: None)
-        self.on_done      = on_done     or (lambda: None)
-        self.on_error     = on_error    or (lambda m: None)
-        self.repair_only  = repair_only
+        self.server_url    = server_url.rstrip("/")
+        self.game_dir      = Path(game_dir)
+        self.on_progress   = on_progress or (lambda *a: None)
+        self.on_status     = on_status   or (lambda m: None)
+        self.on_phase      = on_phase    or (lambda p: None)
+        self.on_done       = on_done     or (lambda: None)
+        self.on_error      = on_error    or (lambda m: None)
+        self.repair_only   = repair_only
         self.max_concurrent = max_concurrent_chunks
-        self._stop        = threading.Event()
+        self._stop         = threading.Event()
 
     def stop(self):
         self._stop.set()
 
-    # ── Public entry-point ────────────────────────────────────────────────
+    # ── Entry-point ───────────────────────────────────────────────────────
 
     def run(self):
         try:
+            log.info("Downloader.run() started  game_dir=%s", self.game_dir)
             manifest, server_chunks = self._fetch_manifest()
 
-            if self.repair_only:
-                needed_hashes = self._find_bad_hashes(manifest)
-            else:
-                needed_hashes = self._find_missing_or_bad_hashes(manifest)
+            needed_hashes = self._find_missing_or_bad_hashes(manifest)
+            log.info("Need %d hashes  chunks_available=%d",
+                     len(needed_hashes), len(server_chunks))
 
             if needed_hashes:
-                # Resolve which server chunks contain our needed files so we
-                # only fetch the chunks we actually need.
                 chunks_to_fetch = _filter_chunks(server_chunks, needed_hashes)
+                log.info("Fetching %d/%d chunks", len(chunks_to_fetch), len(server_chunks))
                 self._download_chunks(chunks_to_fetch, needed_hashes, manifest)
             else:
                 self.on_status("Nothing to download.")
@@ -126,9 +125,10 @@ class Downloader:
             ]
             failed = self._verify(verify_set)
             if failed:
-                self.on_status(f"Repairing {len(failed)} bad file(s)…")
-                self._repair_individual(failed)
-                still_bad = self._verify(failed)   # re-check only the repaired set
+                log.info("%d files failed verify — running smart repair", len(failed))
+                self.on_status(f"Repairing {len(failed)} file(s)…")
+                self._smart_repair(failed, server_chunks, manifest)
+                still_bad = self._verify(failed)
                 if still_bad:
                     raise RuntimeError(
                         "Verification failed for: "
@@ -140,6 +140,7 @@ class Downloader:
             self.on_done()
 
         except Exception as exc:
+            log.exception("Downloader.run() failed")
             self.on_phase("error")
             self.on_error(str(exc))
 
@@ -147,15 +148,18 @@ class Downloader:
 
     def _fetch_manifest(self) -> tuple[list[dict], list[dict]]:
         self.on_status("Fetching manifest…")
-        with urllib.request.urlopen(f"{self.server_url}/manifest", timeout=15) as r:
-            data = json.loads(r.read())
-        # Support both the new {files, chunks} format and the old flat list.
+        url = f"{self.server_url}/manifest"
+        log.info("GET %s", url)
+        with urllib.request.urlopen(url, timeout=15) as r:
+            raw = r.read()
+        log.info("Manifest response: %d bytes", len(raw))
+        data = json.loads(raw)
         if isinstance(data, list):
-            files  = data
-            chunks = []
+            files, chunks = data, []
         else:
             files  = data.get("files", [])
             chunks = data.get("chunks", [])
+        log.info("Manifest parsed: %d files, %d chunks", len(files), len(chunks))
         self.on_status(f"Manifest: {len(files)} files in {len(chunks)} chunks")
         return files, chunks
 
@@ -176,10 +180,6 @@ class Downloader:
                 needed.add(entry["hash"])
         return needed
 
-    def _find_bad_hashes(self, manifest: list[dict]) -> set[str]:
-        """Repair mode — same logic, explicit name for clarity."""
-        return self._find_missing_or_bad_hashes(manifest)
-
     # ── Chunk download ────────────────────────────────────────────────────
 
     def _download_chunks(
@@ -189,7 +189,7 @@ class Downloader:
         manifest:      list[dict],
     ) -> None:
         if not chunks:
-            # Server is old-format (no chunk map). Fall back to legacy batch.
+            log.warning("No chunks available — falling back to legacy /batch")
             self._legacy_batch_download(
                 [e for e in manifest if e["hash"] in needed_hashes],
                 manifest,
@@ -198,20 +198,19 @@ class Downloader:
 
         self.on_phase("downloading")
 
-        # Build hash → [entry] for fast lookup when extracting.
         hash_to_entries: dict[str, list[dict]] = {}
         for e in manifest:
             hash_to_entries.setdefault(e["hash"], []).append(e)
 
         total_files = sum(
-            len([h for h in c["hashes"] if h in needed_hashes])
+            sum(1 for h in c["hashes"] if h in needed_hashes)
             for c in chunks
         )
         total_bytes = sum(
-            e["size"]
-            for e in manifest
-            if e["hash"] in needed_hashes
+            e["size"] for e in manifest if e["hash"] in needed_hashes
         )
+        log.info("Download plan: %d files, %.1f MB across %d chunks",
+                 total_files, total_bytes / 1_048_576, len(chunks))
 
         loop = asyncio.new_event_loop()
         try:
@@ -239,103 +238,206 @@ class Downloader:
         lock      = asyncio.Lock()
         progress  = {"files": 0, "bytes": 0}
 
-        # Use a single connector with a generous pool.
         connector = aiohttp.TCPConnector(
             limit=self.max_concurrent * 2,
             limit_per_host=self.max_concurrent * 2,
         )
-        async with aiohttp.ClientSession(connector=connector) as session:
 
-            async def fetch_one(chunk_idx: int, chunk: dict):
-                async with semaphore:
-                    if self._stop.is_set():
-                        return
+        async def fetch_one(chunk_idx: int, chunk: dict):
+            async with semaphore:
+                if self._stop.is_set():
+                    return
 
-                    chunk_id  = chunk["id"]
-                    chunk_hashes = [h for h in chunk["hashes"] if h in needed_hashes]
-                    if not chunk_hashes:
-                        return   # nothing we need in this chunk
+                chunk_id = chunk["id"]
+                n_needed = sum(1 for h in chunk["hashes"] if h in needed_hashes)
+                if n_needed == 0:
+                    log.debug("Chunk %s: nothing needed, skipping", chunk_id)
+                    return
 
-                    label = f"{chunk_idx + 1}/{len(chunks)}"
-                    self.on_status(
-                        f"Downloading chunk {label} "
-                        f"({len(chunk_hashes)} files)…"
-                    )
+                label = f"{chunk_idx + 1}/{len(chunks)}"
+                self.on_status(f"Downloading chunk {label} ({n_needed} files)…")
+                url = f"{self.server_url}/chunk/{chunk_id}"
+                log.info("GET %s  (%d files needed)", url, n_needed)
 
-                    # ── Stream the zip, writing to a BytesIO as it arrives ──
-                    # This overlaps network I/O and disk I/O: we start
-                    # extracting as soon as the download finishes, while
-                    # the next chunk is already downloading in parallel.
-                    buf = io.BytesIO()
+                buf = io.BytesIO()
+                async with aiohttp.ClientSession(connector=connector) as session:
                     async with session.get(
-                        f"{self.server_url}/chunk/{chunk_id}",
+                        url,
                         timeout=aiohttp.ClientTimeout(total=300),
                     ) as resp:
                         if resp.status != 200:
                             raise RuntimeError(
                                 f"Chunk {chunk_id} returned HTTP {resp.status}"
                             )
-                        # Read in large chunks to keep TCP windows full.
-                        async for raw in resp.content.iter_chunked(1 << 17):  # 128 KB
+                        content_length = resp.headers.get("Content-Length", "unknown")
+                        log.info("Chunk %s: status=%d content-length=%s",
+                                 chunk_id, resp.status, content_length)
+                        async for raw in resp.content.iter_chunked(1 << 17):
                             buf.write(raw)
 
-                    # ── Extract in a thread to keep the event loop free ────
-                    loop = asyncio.get_running_loop()
+                received = buf.tell()
+                log.info("Chunk %s: received %d bytes", chunk_id, received)
 
-                    def extract():
-                        written_bytes = 0
-                        written_files = 0
-                        buf.seek(0)
-                        with zipfile.ZipFile(buf) as zf:
-                            for name in zf.namelist():
-                                if name not in chunk_hashes:
-                                    continue   # file not needed this run
-                                entries = hash_to_entries.get(name, [])
-                                if not entries:
-                                    continue
+                if received == 0:
+                    raise RuntimeError(f"Chunk {chunk_id}: server sent 0 bytes")
+
+                # Capture loop variables explicitly so the closure is unambiguous.
+                _buf       = buf
+                _needed    = needed_hashes
+                _h2e       = hash_to_entries
+                _game_dir  = self.game_dir
+                _chunk_id  = chunk_id
+                _received  = received
+
+                loop = asyncio.get_running_loop()
+
+                def extract() -> tuple[int, int]:
+                    written_bytes = 0
+                    written_files = 0
+                    _buf.seek(0)
+                    try:
+                        zf = zipfile.ZipFile(_buf)
+                    except zipfile.BadZipFile as exc:
+                        raise RuntimeError(
+                            f"Chunk {_chunk_id} is not a valid zip "
+                            f"(received {_received} bytes): {exc}"
+                        ) from exc
+
+                    names = zf.namelist()
+                    log.info("Chunk %s zip: %d entries", _chunk_id, len(names))
+
+                    with zf:
+                        for name in names:
+                            if name not in _needed:
+                                continue
+                            entries = _h2e.get(name, [])
+                            if not entries:
+                                log.warning("Chunk %s: hash %s in zip but "
+                                            "not in manifest", _chunk_id, name[:16])
+                                continue
+                            try:
                                 data = zf.read(name)
-                                for entry in entries:
-                                    dest = self.game_dir / entry["path"]
-                                    dest.parent.mkdir(parents=True, exist_ok=True)
-                                    dest.write_bytes(data)
-                                    written_bytes += entry.get("size", 0)
-                                    written_files += 1
-                        return written_bytes, written_files
+                            except Exception as exc:
+                                log.error("Chunk %s: read error for %s: %s",
+                                          _chunk_id, name[:16], exc)
+                                raise
+                            for entry in entries:
+                                dest = _game_dir / entry["path"]
+                                dest.parent.mkdir(parents=True, exist_ok=True)
+                                dest.write_bytes(data)
+                                written_bytes += entry.get("size", 0)
+                                written_files += 1
 
-                    b, f = await loop.run_in_executor(executor, extract)
+                    log.info("Chunk %s: wrote %d/%d files",
+                             _chunk_id, written_files, len(names))
+                    return written_bytes, written_files
 
-                    async with lock:
-                        progress["bytes"] += b
-                        progress["files"] += f
+                b, f = await loop.run_in_executor(executor, extract)
 
-                    self.on_progress(
-                        progress["files"], total_files,
-                        progress["bytes"], total_bytes,
-                    )
+                async with lock:
+                    progress["bytes"] += b
+                    progress["files"] += f
 
-            tasks = [
-                asyncio.create_task(fetch_one(i, c))
-                for i, c in enumerate(chunks)
-            ]
+                self.on_progress(
+                    progress["files"], total_files,
+                    progress["bytes"], total_bytes,
+                )
+
+        tasks = [
+            asyncio.create_task(fetch_one(i, c))
+            for i, c in enumerate(chunks)
+        ]
+
+        try:
             results = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            executor.shutdown(wait=True)
+            await connector.close()
 
-        executor.shutdown(wait=False)
-
-        # Surface any exceptions (cancelled counts as RuntimeError above).
         for r in results:
             if isinstance(r, Exception) and not self._stop.is_set():
                 raise r
 
-    # ── Legacy batch fallback (old server format) ─────────────────────────
+    # ── Smart repair (chunk-aware) ────────────────────────────────────────
+
+    def _smart_repair(
+        self,
+        failed:        list[dict],
+        server_chunks: list[dict],
+        manifest:      list[dict],
+    ) -> None:
+        """
+        For each server chunk, if >= CHUNK_REPAIR_THRESHOLD of its files need
+        repair, fetch the whole chunk (fast).  The remainder go file-by-file.
+        """
+        if not server_chunks:
+            self._repair_individual(failed)
+            return
+
+        failed_hashes = {e["hash"] for e in failed}
+        covered_by_chunk: set[str] = set()
+
+        do_chunks:     list[dict] = []
+        do_individual: list[dict] = []
+
+        for chunk in server_chunks:
+            chunk_total  = len(chunk["hashes"])
+            chunk_needed = sum(1 for h in chunk["hashes"] if h in failed_hashes)
+            if chunk_needed == 0:
+                continue
+            ratio = chunk_needed / chunk_total
+            log.info("Repair chunk %s: %d/%d files bad (%.0f%%)",
+                     chunk["id"], chunk_needed, chunk_total, ratio * 100)
+            if ratio >= _CHUNK_REPAIR_THRESHOLD:
+                do_chunks.append(chunk)
+                covered_by_chunk.update(chunk["hashes"])
+            # else individual — handled below
+
+        for e in failed:
+            if e["hash"] not in covered_by_chunk:
+                do_individual.append(e)
+
+        log.info("Repair plan: %d full chunks, %d individual files",
+                 len(do_chunks), len(do_individual))
+
+        if do_chunks:
+            self._download_chunks(do_chunks, failed_hashes, manifest)
+
+        if do_individual:
+            self._repair_individual(do_individual)
+
+    # ── Individual file repair ────────────────────────────────────────────
+
+    def _repair_individual(self, entries: list[dict]) -> None:
+        """Re-download single files via /file/<hash>. Progress per file."""
+        self.on_phase("downloading")
+        total = len(entries)
+        log.info("Individual repair: %d files", total)
+        for idx, entry in enumerate(entries):
+            if self._stop.is_set():
+                break
+            rel  = entry["path"]
+            dest = self.game_dir / rel
+            self.on_status(f"Repairing [{idx + 1}/{total}] {rel}")
+            url = f"{self.server_url}/file/{entry['hash']}"
+            log.info("GET %s -> %s", url, dest)
+            try:
+                with urllib.request.urlopen(url, timeout=60) as r:
+                    data = r.read()
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(data)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to repair {rel}: {exc}") from exc
+            self.on_progress(idx + 1, total, idx + 1, total)
+
+    # ── Legacy batch fallback ─────────────────────────────────────────────
 
     def _legacy_batch_download(
         self,
         entries:        list[dict],
         total_manifest: list[dict],
     ) -> None:
-        """Keeps compatibility with servers that don't expose /chunk."""
         self.on_phase("downloading")
-
         hash_to_entries: dict[str, list[dict]] = {}
         for e in entries:
             hash_to_entries.setdefault(e["hash"], []).append(e)
@@ -364,7 +466,6 @@ class Downloader:
             )
         finally:
             loop.close()
-
         self.on_status("Download complete.")
 
     async def _async_legacy_batches(
@@ -394,6 +495,8 @@ class Downloader:
                         json={"hashes": hashes},
                         timeout=aiohttp.ClientTimeout(total=300),
                     ) as resp:
+                        if resp.status != 200:
+                            raise RuntimeError(f"/batch returned HTTP {resp.status}")
                         raw = await resp.read()
 
                     loop = asyncio.get_running_loop()
@@ -424,61 +527,28 @@ class Downloader:
                 for i, b in enumerate(batches)
             ])
 
-    # ── Individual file repair (used after verify failure) ────────────────
-
-    def _repair_individual(self, entries: list[dict]) -> None:
-        """
-        Re-downloads individual files via /file/<hash>.
-        Used when a small number of files fail the post-download verify.
-        Shows per-file progress so the UI isn't blank.
-        """
-        self.on_phase("downloading")
-        total = len(entries)
-        for idx, entry in enumerate(entries):
-            if self._stop.is_set():
-                break
-            rel  = entry["path"]
-            dest = self.game_dir / rel
-            self.on_status(f"Repairing [{idx + 1}/{total}] {rel}")
-            try:
-                with urllib.request.urlopen(
-                    f"{self.server_url}/file/{entry['hash']}", timeout=60
-                ) as r:
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    dest.write_bytes(r.read())
-            except Exception as e:
-                raise RuntimeError(f"Failed to repair {rel}: {e}") from e
-            self.on_progress(idx + 1, total, idx + 1, total)
-
     # ── Verify (parallel) ─────────────────────────────────────────────────
 
     def _verify(self, manifest: list[dict]) -> list[dict]:
-        """
-        Hash-check all files in *manifest* using a thread pool.
-        Returns entries that are missing or have wrong hashes.
-        Progress is reported after each file so the UI stays responsive.
-        """
         self.on_phase("verifying")
         total = len(manifest)
         if total == 0:
             return []
 
-        bad:      list[dict]  = []
-        lock      = threading.Lock()
-        done_count            = [0]   # mutable int via list
+        bad:        list[dict] = []
+        lock        = threading.Lock()
+        done_count  = [0]
 
-        def check_one(entry: dict) -> dict | None:
+        def check_one(entry: dict):
             if self._stop.is_set():
                 return None
-            rel  = entry["path"]
-            dest = self.game_dir / rel
+            dest = self.game_dir / entry["path"]
             result = None
             if not dest.exists() or self._hash_file(dest) != entry["hash"]:
                 result = entry
             with lock:
                 done_count[0] += 1
                 n = done_count[0]
-            # Status update only every 10 files to avoid flooding the UI thread.
             if n % 10 == 0 or n == total:
                 self.on_status(f"Verifying {n}/{total} files…")
             self.on_progress(n, total, n, total)
@@ -489,6 +559,7 @@ class Downloader:
                 if result is not None:
                     bad.append(result)
 
+        log.info("Verify complete: %d/%d bad", len(bad), total)
         return bad
 
     # ── Version writing ───────────────────────────────────────────────────
@@ -519,9 +590,5 @@ class Downloader:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _filter_chunks(
-    server_chunks: list[dict],
-    needed_hashes: set[str],
-) -> list[dict]:
-    """Return only chunks that contain at least one needed hash."""
+def _filter_chunks(server_chunks: list[dict], needed_hashes: set[str]) -> list[dict]:
     return [c for c in server_chunks if any(h in needed_hashes for h in c["hashes"])]

@@ -59,12 +59,11 @@ def _compression_for(name: str) -> int:
             else zipfile.ZIP_DEFLATED)
 
 
-def _build_zip(hashes: list[str]) -> bytes:
-    """Build a zip in memory containing files keyed by their hash."""
+def _build_zip(hashes: list[str], hash_to_path: dict[str, Path]) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         for h in hashes:
-            path = HASH_TO_PATH.get(h)
+            path = hash_to_path.get(h)      # ← use the passed parameter
             if path and path.exists():
                 zf.write(path, arcname=h,
                          compress_type=_compression_for(path.name),
@@ -110,7 +109,7 @@ def index_and_prebuild(base: Path) -> None:
         chunk_id = f"chunk_{len(chunks):04d}"
         print(f"[server]   Building {chunk_id} "
               f"({len(current_hashes)} files, {current_mb:.1f} MB) …", flush=True)
-        data = _build_zip(current_hashes)
+        data = _build_zip(current_hashes, hash_to_path)
         chunks.append({"id": chunk_id, "hashes": list(current_hashes)})
         chunk_data[chunk_id] = data
         current_hashes = []
