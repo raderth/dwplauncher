@@ -130,10 +130,14 @@ class Downloader:
                 self._smart_repair(failed, server_chunks, manifest)
                 still_bad = self._verify(failed)
                 if still_bad:
-                    raise RuntimeError(
-                        "Verification failed for: "
-                        + ", ".join(e["path"] for e in still_bad[:5])
-                    )
+                    log.warning("%d files still bad after chunk repair - falling back to individual repair", len(still_bad))
+                    self._repair_individual(still_bad)
+                    still_bad_after_individual = self._verify(still_bad)
+                    if still_bad_after_individual:
+                        raise RuntimeError(
+                            "Verification failed for: "
+                            + ", ".join(e["path"] for e in still_bad_after_individual[:5])
+                        )
 
             self._write_version()
             self.on_phase("done")
@@ -217,7 +221,7 @@ class Downloader:
             loop.run_until_complete(
                 self._async_fetch_chunks(
                     chunks, needed_hashes, hash_to_entries,
-                    total_files, total_bytes,
+                    total_files, total_bytes, manifest
                 )
             )
         finally:
@@ -232,8 +236,8 @@ class Downloader:
         hash_to_entries: dict[str, list[dict]],
         total_files:     int,
         total_bytes:     int,
+        manifest:        list[dict],   # now passed in for fallback
     ) -> None:
-        semaphore = asyncio.Semaphore(self.max_concurrent)
         executor  = ThreadPoolExecutor(max_workers=self.max_concurrent)
         lock      = asyncio.Lock()
         progress  = {"files": 0, "bytes": 0}
@@ -243,120 +247,141 @@ class Downloader:
             limit_per_host=self.max_concurrent * 2,
         )
 
-        async def fetch_one(chunk_idx: int, chunk: dict):
-            async with semaphore:
-                if self._stop.is_set():
-                    return
-
-                chunk_id = chunk["id"]
-                n_needed = sum(1 for h in chunk["hashes"] if h in needed_hashes)
-                if n_needed == 0:
-                    log.debug("Chunk %s: nothing needed, skipping", chunk_id)
-                    return
-
-                label = f"{chunk_idx + 1}/{len(chunks)}"
-                self.on_status(f"Downloading chunk {label} ({n_needed} files)…")
-                url = f"{self.server_url}/chunk/{chunk_id}"
-                log.info("GET %s  (%d files needed)", url, n_needed)
-
-                buf = io.BytesIO()
-                async with aiohttp.ClientSession(connector=connector) as session:
-                    async with session.get(
-                        url,
-                        timeout=aiohttp.ClientTimeout(total=300),
-                    ) as resp:
+        async def _fetch_with_retry(session, url, chunk_id, max_retries=3):
+            last_exc = None
+            for attempt in range(max_retries + 1):
+                try:
+                    # Adjusted timeouts – tune if needed
+                    timeout = aiohttp.ClientTimeout(total=300, connect=15, sock_read=60)
+                    async with session.get(url, timeout=timeout) as resp:
                         if resp.status != 200:
-                            raise RuntimeError(
-                                f"Chunk {chunk_id} returned HTTP {resp.status}"
-                            )
-                        content_length = resp.headers.get("Content-Length", "unknown")
-                        log.info("Chunk %s: status=%d content-length=%s",
-                                 chunk_id, resp.status, content_length)
+                            raise RuntimeError(f"Chunk {chunk_id} returned HTTP {resp.status}")
+                        buf = io.BytesIO()
                         async for raw in resp.content.iter_chunked(1 << 17):
                             buf.write(raw)
+                        return buf
+                except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+                    last_exc = exc
+                    if attempt < max_retries:
+                        log.warning("Chunk %s attempt %d failed: %s  … retrying",
+                                    chunk_id, attempt + 1, exc)
+                        await asyncio.sleep(2 * (attempt + 1))   # slightly longer backoff
+                    else:
+                        raise RuntimeError(f"Chunk {chunk_id} failed after {max_retries+1} attempts: {last_exc}")
 
-                received = buf.tell()
-                log.info("Chunk %s: received %d bytes", chunk_id, received)
+        # Queue for work distribution
+        work_queue = asyncio.Queue()
+        for i, c in enumerate(chunks):
+            n_needed = sum(1 for h in c["hashes"] if h in needed_hashes)
+            if n_needed:
+                work_queue.put_nowait((i, c, n_needed))
 
-                if received == 0:
-                    raise RuntimeError(f"Chunk {chunk_id}: server sent 0 bytes")
+        # Set to collect hashes that couldn't be downloaded
+        failed_hashes = set()
 
-                # Capture loop variables explicitly so the closure is unambiguous.
-                _buf       = buf
-                _needed    = needed_hashes
-                _h2e       = hash_to_entries
-                _game_dir  = self.game_dir
-                _chunk_id  = chunk_id
-                _received  = received
+        async def worker():
+            try:
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    while not self._stop.is_set():
+                        try:
+                            idx, chunk, n_needed = work_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            return
 
-                loop = asyncio.get_running_loop()
+                        chunk_id = chunk["id"]
+                        label = f"{idx + 1}/{len(chunks)}"
+                        self.on_status(f"Downloading chunk {label} ({n_needed} files)…")
+                        url = f"{self.server_url}/chunk/{chunk_id}"
+                        log.info("GET %s  (%d files needed)", url, n_needed)
 
-                def extract() -> tuple[int, int]:
-                    written_bytes = 0
-                    written_files = 0
-                    _buf.seek(0)
-                    try:
-                        zf = zipfile.ZipFile(_buf)
-                    except zipfile.BadZipFile as exc:
-                        raise RuntimeError(
-                            f"Chunk {_chunk_id} is not a valid zip "
-                            f"(received {_received} bytes): {exc}"
-                        ) from exc
+                        try:
+                            buf = await _fetch_with_retry(session, url, chunk_id)
+                        except Exception as exc:
+                            log.error("Chunk %s failed permanently: %s", chunk_id, exc)
+                            for h in chunk["hashes"]:
+                                if h in needed_hashes:
+                                    failed_hashes.add(h)
+                            continue   # proceed to next chunk
 
-                    names = zf.namelist()
-                    log.info("Chunk %s zip: %d entries", _chunk_id, len(names))
+                        received = buf.tell()
+                        log.info("Chunk %s: received %d bytes", chunk_id, received)
+                        if received == 0:
+                            log.error("Chunk %s: server sent 0 bytes, marking as failed", chunk_id)
+                            for h in chunk["hashes"]:
+                                if h in needed_hashes:
+                                    failed_hashes.add(h)
+                            continue
 
-                    with zf:
-                        for name in names:
-                            if name not in _needed:
-                                continue
-                            entries = _h2e.get(name, [])
-                            if not entries:
-                                log.warning("Chunk %s: hash %s in zip but "
-                                            "not in manifest", _chunk_id, name[:16])
-                                continue
+                        # ── extraction ────────────────────────────────
+                        _buf       = buf
+                        _needed    = needed_hashes
+                        _h2e       = hash_to_entries
+                        _game_dir  = self.game_dir
+                        _chunk_id  = chunk_id
+                        _received  = received
+
+                        loop = asyncio.get_running_loop()
+
+                        def extract():
+                            written_bytes = 0
+                            written_files = 0
+                            _buf.seek(0)
                             try:
-                                data = zf.read(name)
-                            except Exception as exc:
-                                log.error("Chunk %s: read error for %s: %s",
-                                          _chunk_id, name[:16], exc)
-                                raise
-                            for entry in entries:
-                                dest = _game_dir / entry["path"]
-                                dest.parent.mkdir(parents=True, exist_ok=True)
-                                dest.write_bytes(data)
-                                written_bytes += entry.get("size", 0)
-                                written_files += 1
+                                zf = zipfile.ZipFile(_buf)
+                            except zipfile.BadZipFile as exc:
+                                raise RuntimeError(f"Chunk {_chunk_id} is not a valid zip: {exc}")
+                            names = zf.namelist()
+                            log.info("Chunk %s zip: %d entries", _chunk_id, len(names))
+                            with zf:
+                                for name in names:
+                                    if name not in _needed:
+                                        continue
+                                    entries = _h2e.get(name, [])
+                                    if not entries:
+                                        log.warning("Chunk %s: hash %s in zip but not in manifest", _chunk_id, name[:16])
+                                        continue
+                                    data = zf.read(name)
+                                    for entry in entries:
+                                        dest = _game_dir / entry["path"]
+                                        dest.parent.mkdir(parents=True, exist_ok=True)
+                                        dest.write_bytes(data)
+                                        written_bytes += entry.get("size", 0)
+                                        written_files += 1
+                            log.info("Chunk %s: wrote %d/%d files", _chunk_id, written_files, len(names))
+                            return written_bytes, written_files
 
-                    log.info("Chunk %s: wrote %d/%d files",
-                             _chunk_id, written_files, len(names))
-                    return written_bytes, written_files
+                        try:
+                            b, f = await loop.run_in_executor(executor, extract)
+                        except Exception as exc:
+                            log.error("Chunk %s extraction failed: %s", chunk_id, exc)
+                            for h in chunk["hashes"]:
+                                if h in needed_hashes:
+                                    failed_hashes.add(h)
+                            continue
 
-                b, f = await loop.run_in_executor(executor, extract)
+                        async with lock:
+                            progress["bytes"] += b
+                            progress["files"] += f
 
-                async with lock:
-                    progress["bytes"] += b
-                    progress["files"] += f
+                        self.on_progress(
+                            progress["files"], total_files,
+                            progress["bytes"], total_bytes,
+                        )
+            except asyncio.CancelledError:
+                pass
 
-                self.on_progress(
-                    progress["files"], total_files,
-                    progress["bytes"], total_bytes,
-                )
-
-        tasks = [
-            asyncio.create_task(fetch_one(i, c))
-            for i, c in enumerate(chunks)
-        ]
-
+        workers = [asyncio.create_task(worker()) for _ in range(self.max_concurrent)]
         try:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*workers)   # no more return_exceptions=True, workers handle errors
         finally:
             executor.shutdown(wait=True)
             await connector.close()
 
-        for r in results:
-            if isinstance(r, Exception) and not self._stop.is_set():
-                raise r
+        if failed_hashes and not self._stop.is_set():
+            log.warning("%d hashes could not be downloaded as chunks — falling back to individual repair",
+                        len(failed_hashes))
+            broken_entries = [e for e in manifest if e["hash"] in failed_hashes]
+            self._repair_individual(broken_entries)
 
     # ── Smart repair (chunk-aware) ────────────────────────────────────────
 
