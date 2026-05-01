@@ -919,6 +919,7 @@ class API:
 
     # ── Download / Repair ──────────────────────────────────────────────────
     def start_download(self, repair_only: bool = False):
+        self._repair_active = repair_only
         if self._btn_state in ("downloading", "verifying"):
             return
         if not repair_only and version.mc_version_changed(
@@ -948,13 +949,14 @@ class API:
         self.start_download(repair_only=True)
 
     def _on_progress(self, done, total, bytes_done, bytes_total):
-        pct  = int((done / total * 100) if total else 0)
-        mb   = bytes_done  / 1_048_576
-        mb_t = bytes_total / 1_048_576
-        if self._btn_state == "downloading":
+        pct = int((done / total * 100) if total else 0)
+        if self._btn_state == "verifying":
+            # Verify/repair passes file counts in both pairs, not bytes
+            self._js(f"setProgress({pct},'{"REPAIRING" if getattr(self,"_repair_active",False) else "VERIFYING"}','{done}/{total} files')")
+        elif self._btn_state == "downloading":
+            mb   = bytes_done  / 1_048_576
+            mb_t = bytes_total / 1_048_576
             self._js(f"setProgress({pct},'DOWNLOADING','{pct}%  {mb:.0f}/{mb_t:.0f} MB')")
-        else:
-            self._js(f"setProgress({pct},'VERIFYING','{done}/{total} files')")
 
     def _on_status(self, msg: str):
         self._js(f"setStatus({json.dumps(msg)})")
@@ -973,6 +975,10 @@ class API:
             ver = version.local_version(self._cfg["game_dir"])
             if ver:
                 self._js(f"setVersion('Version: {ver.get('version', '?')}')")
+        elif phase == "verifying":
+          self._btn_state = "verifying"
+          label = "REPAIRING" if getattr(self, '_repair_active', False) else "VERIFYING"
+          self._js(f"setBtnState('verifying',{json.dumps(label)},'',0)")
                 
         elif phase == "error":
             self._btn_state = "error"
