@@ -1116,7 +1116,7 @@ def run(server_url: str, game_dir: str):
         height           = 480,
         resizable        = True,
         frameless        = True,
-        easy_drag        = True,
+      easy_drag        = False,
         background_color = "#0a0a0a",
     )
     window_holder.append(win)

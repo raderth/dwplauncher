@@ -22,6 +22,8 @@ import logging
 import threading
 import urllib.request
 import zipfile
+import os
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Optional
@@ -259,7 +261,8 @@ class Downloader:
                         if resp.status != 200:
                             raise RuntimeError(f"Chunk {chunk_id} returned HTTP {resp.status}")
                         buf = io.BytesIO()
-                        async for raw in resp.content.iter_chunked(1 << 17):
+                        # Use larger read buffer for better throughput
+                        async for raw in resp.content.iter_chunked(1 << 20):
                             buf.write(raw)
                         return buf
                 except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
@@ -343,10 +346,32 @@ class Downloader:
                                         log.warning("Chunk %s: hash %s in zip but not in manifest", _chunk_id, name[:16])
                                         continue
                                     data = zf.read(name)
+                                    # Verify the entry's data matches the hash filename
+                                    try:
+                                        actual = hashlib.sha256(data).hexdigest()
+                                    except Exception:
+                                        actual = None
+                                    if actual != name:
+                                        log.error("Chunk %s: entry %s failed hash check (expected %s, got %s)", _chunk_id, name[:16], name[:16], (actual or '')[:16])
+                                        # mark as failed by raising so the outer handler can record it
+                                        raise RuntimeError(f"Chunk {_chunk_id} contains corrupted entry {name}")
                                     for entry in entries:
                                         dest = _game_dir / entry["path"]
                                         dest.parent.mkdir(parents=True, exist_ok=True)
-                                        dest.write_bytes(data)
+                                        # atomic write to avoid partially written files
+                                        fd, tmp_path = tempfile.mkstemp(prefix="dwpdl-", dir=str(dest.parent))
+                                        try:
+                                            with os.fdopen(fd, "wb") as tf:
+                                                tf.write(data)
+                                                tf.flush()
+                                                os.fsync(tf.fileno())
+                                            os.replace(tmp_path, str(dest))
+                                        finally:
+                                            if os.path.exists(tmp_path):
+                                                try:
+                                                    os.remove(tmp_path)
+                                                except Exception:
+                                                    pass
                                         written_bytes += entry.get("size", 0)
                                         written_files += 1
                             log.info("Chunk %s: wrote %d/%d files", _chunk_id, written_files, len(names))
@@ -451,8 +476,24 @@ class Downloader:
             try:
                 with urllib.request.urlopen(url, timeout=60) as r:
                     data = r.read()
+                # Verify content matches expected hash
+                actual = hashlib.sha256(data).hexdigest()
+                if actual != entry["hash"]:
+                    raise RuntimeError(f"Hash mismatch for {rel}: expected {entry['hash']}, got {actual}")
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(data)
+                fd, tmp_path = tempfile.mkstemp(prefix="dwpdl-", dir=str(dest.parent))
+                try:
+                    with os.fdopen(fd, "wb") as tf:
+                        tf.write(data)
+                        tf.flush()
+                        os.fsync(tf.fileno())
+                    os.replace(tmp_path, str(dest))
+                finally:
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
             except Exception as exc:
                 raise RuntimeError(f"Failed to repair {rel}: {exc}") from exc
             self.on_progress(idx + 1, total, idx + 1, total)
@@ -532,10 +573,31 @@ class Downloader:
                         b = f = 0
                         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
                             for name in zf.namelist():
+                                data = zf.read(name)
+                                # verify entry hash matches filename
+                                try:
+                                    actual = hashlib.sha256(data).hexdigest()
+                                except Exception:
+                                    actual = None
+                                if actual != name:
+                                    log.error("Batch zip: entry %s failed hash (expected %s, got %s)", name[:16], name[:16], (actual or '')[:16])
+                                    raise RuntimeError(f"Batch contains corrupted entry {name}")
                                 for entry in hash_to_entries.get(name, []):
                                     dest = self.game_dir / entry["path"]
                                     dest.parent.mkdir(parents=True, exist_ok=True)
-                                    dest.write_bytes(zf.read(name))
+                                    fd, tmp_path = tempfile.mkstemp(prefix="dwpdl-", dir=str(dest.parent))
+                                    try:
+                                        with os.fdopen(fd, "wb") as tf:
+                                            tf.write(data)
+                                            tf.flush()
+                                            os.fsync(tf.fileno())
+                                        os.replace(tmp_path, str(dest))
+                                    finally:
+                                        if os.path.exists(tmp_path):
+                                            try:
+                                                os.remove(tmp_path)
+                                            except Exception:
+                                                pass
                                     b += entry.get("size", 0)
                                     f += 1
                         return b, f
