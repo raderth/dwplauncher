@@ -11,7 +11,7 @@ Endpoints:
     GET  /chunk/<chunk_id>  → raw zip bytes (pre-built at startup)
     GET  /file/<sha256>     → raw file bytes  (single-file fallback / repair)
     GET  /health            → { status, files, chunks }
-    GET  /version           → { version }
+    GET  /version           → { version, mc_version, fabric_version, mods: {mod_name: version} }
 """
 
 import hashlib
@@ -24,6 +24,7 @@ import argparse
 from pathlib import Path
 import tempfile
 import shutil
+import re
 
 from flask import Flask, Response, jsonify, send_file, abort, stream_with_context
 
@@ -37,6 +38,7 @@ MANIFEST:      list[dict]       = []   # [{hash, path, size}, …]
 HASH_TO_PATH:  dict[str, Path]  = {}   # sha256 → absolute Path
 CHUNKS:        list[dict]       = []   # [{id, hashes: [...]}]
 CHUNK_DIR: Path = None
+VERSION_INFO:  dict             = {}   # {mc_version, fabric_version, mods: {name: version}}
 
 # Tuning — adjust to taste.
 _CHUNK_MAX_FILES = 300
@@ -59,6 +61,71 @@ def _compression_for(name: str) -> int:
     return (zipfile.ZIP_STORED
             if Path(name).suffix.lower() in NO_COMPRESS
             else zipfile.ZIP_DEFLATED)
+
+
+def _extract_mod_version(jar_path: Path) -> str | None:
+    """Extract version from fabric.mod.json inside a JAR."""
+    try:
+        with zipfile.ZipFile(jar_path, "r") as z:
+            if "fabric.mod.json" in z.namelist():
+                meta = json.loads(z.read("fabric.mod.json"))
+                return meta.get("version")
+    except Exception:
+        pass
+    return None
+
+
+def _extract_versions_from_manifest(base: Path, manifest: list[dict]) -> dict:
+    """
+    Extract Minecraft version, Fabric version, and mod versions from manifest.
+    - MC version: from versions/<version>/ or <version>/ folder
+    - Fabric version: from fabric-loader or fabric-api JAR
+    - Mods: from mods/ folder
+    """
+    result = {
+        "mc_version": "",
+        "fabric_version": "",
+        "mods": {}
+    }
+    
+    # Find MC version from versions/ or root version folder
+    for entry in manifest:
+        path = entry["path"]
+        parts = Path(path).parts
+        if len(parts) >= 2 and parts[0] in ("versions", ):
+            if re.match(r'^\d+(\.\d+)*$', parts[1]):
+                result["mc_version"] = parts[1]
+                break
+        elif len(parts) >= 1 and re.match(r'^\d+(\.\d+)*$', parts[0]):
+            result["mc_version"] = parts[0]
+            break
+    
+    # Find Fabric version from loader/API JAR
+    fabric_path = base / "mods" / "fabric-loader.jar"
+    if fabric_path.exists():
+        ver = _extract_mod_version(fabric_path)
+        if ver:
+            result["fabric_version"] = ver
+    
+    fabric_api_path = base / "mods" / "fabric-api.jar"
+    if fabric_api_path.exists():
+        ver = _extract_mod_version(fabric_api_path)
+        if ver:
+            result["fabric_version"] = ver
+    
+    # Extract mod versions from manifest (mods/ folder)
+    for entry in manifest:
+        path = entry["path"]
+        parts = Path(path).parts
+        if len(parts) >= 2 and parts[0] == "mods" and parts[1].endswith(".jar"):
+            mod_name = parts[1][:-4]  # remove .jar
+            jar_path = base / path
+            if jar_path.exists():
+                ver = _extract_mod_version(jar_path)
+                if ver:
+                    result["mods"][mod_name] = ver
+    
+    return result
 
 
 def _build_zip_to_disk(hashes: list[str], hash_to_path: dict[str, Path], dest: Path) -> None:
@@ -124,10 +191,13 @@ def index_and_prebuild(base: Path) -> None:
             flush_chunk()
     flush_chunk()
 
+    # Extract version information from manifest
+    version_info = _extract_versions_from_manifest(base, manifest)
+
     # Atomic swap — Flask threads reading the old globals are unaffected.
-    global MANIFEST, HASH_TO_PATH, CHUNKS, CHUNK_DATA
-    MANIFEST, HASH_TO_PATH, CHUNKS, CHUNK_DATA = \
-        manifest, hash_to_path, chunks, None
+    global MANIFEST, HASH_TO_PATH, CHUNKS, VERSION_INFO
+    MANIFEST, HASH_TO_PATH, CHUNKS, VERSION_INFO = \
+        manifest, hash_to_path, chunks, version_info
 
     # Calculate total size from the ON-DISK zips, not from memory
     total_zip_mb = sum(
@@ -137,6 +207,9 @@ def index_and_prebuild(base: Path) -> None:
 
     print(f"[server] Ready — {len(manifest)} files in {len(chunks)} chunks "
           f"({total_zip_mb:.1f} MB pre-compressed)", flush=True)
+    print(f"[server] MC: {version_info.get('mc_version', 'unknown')}, "
+          f"Fabric: {version_info.get('fabric_version', 'unknown')}, "
+          f"Mods: {len(version_info.get('mods', {}))} available", flush=True)
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -178,7 +251,22 @@ def health():
 
 @app.route("/version")
 def version_route():
-    return jsonify({"version": VERSION})
+    """
+    Returns version info including MC version, Fabric version, and mod versions.
+    Format: {
+        "version": "1.1.0",
+        "mc_version": "1.21.1",
+        "fabric_version": "0.15.0",
+        "mods": {
+            "sodium": "0.5.0",
+            "lithium": "0.11.2",
+            ...
+        }
+    }
+    """
+    response = {"version": VERSION}
+    response.update(VERSION_INFO)
+    return jsonify(response)
 
 
 # ── Entry-point ───────────────────────────────────────────────────────────────

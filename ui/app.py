@@ -20,6 +20,7 @@ import sys
 import webbrowser
 import time
 import secrets
+import subprocess
 from pathlib import Path
 
 import requests
@@ -101,6 +102,8 @@ def _build_html(logo_data_uri: str) -> str:
     font-family: 'Inter', sans-serif; font-size: 13px;
     overflow: hidden;
     user-select: none; -webkit-user-select: none;
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
   }}
 
   /* ── Drag strip (top 28px — contains only window controls, nothing else) ── */
@@ -931,8 +934,13 @@ class API:
         self._repair_active = repair_only
         if self._btn_state in ("downloading", "verifying"):
             return
-        if not repair_only and version.mc_version_changed(
-                self._cfg["game_dir"], self._cfg["download_url"]):
+        mods_only = False
+        if not repair_only and version.is_mod_only_update(
+          self._cfg["game_dir"], self._cfg["download_url"]):
+            mods_only = True
+            self._js("setStatus('Checking for mod updates...')")
+        elif not repair_only and version.mc_version_changed(
+          self._cfg["game_dir"], self._cfg["download_url"]):
             import shutil
             mods_path = Path(self._cfg["game_dir"]) / "mods"
             if mods_path.exists():
@@ -952,6 +960,7 @@ class API:
             on_done     = self._on_done,
             on_error    = self._on_error,
             repair_only = repair_only,
+                    mods_only   = mods_only,
         )
         threading.Thread(target=self._dl.run, daemon=True).start()
 
@@ -1061,8 +1070,15 @@ class API:
         def work():
             needs, local, remote = version.needs_update(
                 self._cfg["game_dir"], self._cfg["download_url"])
+            is_mod_only = False
+            if needs and version.is_mod_only_update(
+                    self._cfg["game_dir"], self._cfg["download_url"]):
+                is_mod_only = True
+            
             if local == "none":
                 label, state, lbl = f"Not installed  |  Server: {remote}", "idle", "DOWNLOAD"
+            elif is_mod_only:
+                label, state, lbl = f"Mods available for update", "idle", "UPDATE MODS"
             elif needs:
                 label, state, lbl = f"Update available  {local} → {remote}", "idle", "UPDATE"
             else:

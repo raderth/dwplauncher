@@ -2,10 +2,20 @@
 core/version.py  –  Local version tracking and server version checking.
 
 The server is expected to expose:
-  GET /version  →  {"version": "1.21.11-fabric-3"}
+  GET /version  →  {
+    "version": "1.0.0",
+    "mc_version": "1.21.1",
+    "fabric_version": "0.15.0",
+    "mods": {"sodium": "0.5.0", "lithium": "0.11.2", ...}
+  }
 
 Local version stored at <game_dir>/launcher_version.json:
-  {"version": "1.21.11-fabric-3", "mc_version": "1.21.11"}
+  {
+    "version": "1.0.0",
+    "mc_version": "1.21.1",
+    "fabric_version": "0.15.0",
+    "mods": {"sodium": "0.5.0", ...}
+  }
 """
 import json
 import re
@@ -138,3 +148,61 @@ def mc_version_changed(game_dir: str, server_url: str) -> bool:
     if not local or not remote:
         return False
     return local.get("mc_version", "") != remote.get("mc_version", "")
+
+
+def fabric_version_changed(game_dir: str, server_url: str) -> bool:
+    """True if Fabric version changed (requires full re-download)."""
+    local = local_version(game_dir)
+    remote = server_version(server_url)
+    if not local or not remote:
+        return False
+    return local.get("fabric_version", "") != remote.get("fabric_version", "")
+
+
+def mods_need_update(game_dir: str, server_url: str) -> tuple[bool, dict, dict]:
+    """
+    Check if any mods need updating (version changed or new mods available).
+    Returns (needs_update, local_mods, server_mods).
+    """
+    local = local_version(game_dir)
+    remote = server_version(server_url)
+    
+    local_mods = local.get("mods", {}) if local else {}
+    remote_mods = remote.get("mods", {}) if remote else {}
+    
+    # Check if any mod versions changed or new mods available
+    for mod_name, remote_version in remote_mods.items():
+        local_version_str = local_mods.get(mod_name, "")
+        if local_version_str != remote_version:
+            return True, local_mods, remote_mods
+    
+    # Check if local has mods server doesn't (user added mods locally)
+    for mod_name in local_mods:
+        if mod_name not in remote_mods:
+            # Local mod not on server - this is ok, user can keep it
+            continue
+    
+    return False, local_mods, remote_mods
+
+
+def is_mod_only_update(game_dir: str, server_url: str) -> bool:
+    """
+    Returns True if only mods need updating (MC and Fabric versions match).
+    This means we can do a fast mod-only sync instead of full re-download.
+    """
+    local = local_version(game_dir)
+    remote = server_version(server_url)
+    
+    if not local or not remote:
+        return False
+    
+    # MC and Fabric versions must match
+    mc_match = local.get("mc_version", "") == remote.get("mc_version", "")
+    fabric_match = local.get("fabric_version", "") == remote.get("fabric_version", "")
+    
+    if not (mc_match and fabric_match):
+        return False
+    
+    # Check if mods actually need updating
+    needs_update, _, _ = mods_need_update(game_dir, server_url)
+    return needs_update

@@ -87,6 +87,7 @@ class Downloader:
         on_error:              Optional[Callable] = None,
         repair_only:           bool = False,
         max_concurrent_chunks: int  = _MAX_CONCURRENT,
+        mods_only:             bool = False,  # Only sync mods/ folder when MC/Fabric match
     ):
         self.server_url    = server_url.rstrip("/")
         self.download_url  = download_url.rstrip("/")
@@ -97,6 +98,7 @@ class Downloader:
         self.on_done       = on_done     or (lambda: None)
         self.on_error      = on_error    or (lambda m: None)
         self.repair_only   = repair_only
+        self.mods_only     = mods_only
         self.max_concurrent = max_concurrent_chunks
         self._stop         = threading.Event()
 
@@ -183,6 +185,9 @@ class Downloader:
             if _is_sync_only(rel):
                 if not _sync_present(dest):
                     needed.add(entry["hash"])
+                continue
+            # In mods-only mode, skip all non-mod files
+            if self.mods_only and not _is_sync_only(rel):
                 continue
             if not dest.exists() or self._hash_file(dest) != entry["hash"]:
                 needed.add(entry["hash"])
