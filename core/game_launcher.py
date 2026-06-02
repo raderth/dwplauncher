@@ -2,14 +2,16 @@
 core/game_launcher.py  –  Locate Java and launch Fabric/Minecraft.
 
 Java lookup (in order):
-  1. Bundled: <game_dir>/java/<os>/bin/java   (or javaw.exe on Windows)
-  2. System: JAVA_HOME or PATH (with macOS /usr/libexec/java_home support)
+  1. User‑specified custom_java (from settings)
+  2. Bundled: <game_dir>/java/<os>/bin/java  (or javaw.exe on Windows)
+  3. System:  JAVA_HOME or PATH (with macOS /usr/libexec/java_home support)
 
-Fabric JAR location (checked in order):
-  <game_dir>/versions/<mc_version>/<name>.jar   ← standard Fabric installer
-  <game_dir>/<mc_version>/.fabric/remapped-jars/...
-  <game_dir>/.fabric/remapped-jars/...
+Version JSON / JAR lookup:
+  The Fabric installer creates versions/fabric-loader-<lv>-<mc>/<id>.json
+  and the vanilla JAR lives at versions/<mc>/<mc>.jar.
 """
+
+from __future__ import annotations
 
 import json
 import logging
@@ -20,25 +22,20 @@ import subprocess
 import urllib.request
 from pathlib import Path
 
-# -----------------------------------------------------------------------------
-#  Logging setup
-# -----------------------------------------------------------------------------
 log = logging.getLogger("launcher")
 
 MAVEN_REPOS = [
-    "https://libraries.minecraft.net/",   # Mojang
-    "https://maven.fabricmc.net/",        # Fabric
-    "https://repo1.maven.org/maven2/",    # Maven Central fallback
+    "https://libraries.minecraft.net/",
+    "https://maven.fabricmc.net/",
+    "https://repo1.maven.org/maven2/",
 ]
 
 MAIN_CLASS = "net.fabricmc.loader.impl.launch.knot.KnotClient"
 
 
-# -----------------------------------------------------------------------------
-#  OS helpers
-# -----------------------------------------------------------------------------
+# ── OS helpers ────────────────────────────────────────────────────────────────
+
 def _os_name() -> str:
-    """Returns 'windows', 'macos', or 'linux'."""
     s = platform.system().lower()
     if s == "darwin":
         return "macos"
@@ -51,291 +48,388 @@ def _is_windows() -> bool:
     return platform.system().lower() == "windows"
 
 
-# -----------------------------------------------------------------------------
-#  Java detection (bundled first, then system)
-# -----------------------------------------------------------------------------
-def find_java(game_dir: str) -> Path | None:
-    """
-    Locates a usable Java executable.
-    1. Looks for bundled Java: <game_dir>/java/<os>/bin/java (or javaw.exe on Windows)
-    2. Falls back to system Java (JAVA_HOME or PATH)
-    Returns a Path object or None.
-    """
-    base = Path(game_dir).resolve() / "java" / _os_name() / "bin"
-    log.debug(f"Looking for bundled Java in: {base}")
+# ── Java detection ────────────────────────────────────────────────────────────
 
-    # Executable names: Windows prefers javaw.exe (no console), others use "java"
+def find_java(game_dir: str, custom_java: str | None = None) -> Path | None:
+    """
+    Returns the path to a Java executable.
+    If `custom_java` is provided and points to a valid file, it is used immediately.
+    Otherwise the usual auto‑detection order is followed.
+    """
+    # 1. User‑specified path
+    if custom_java:
+        candidate = Path(custom_java)
+        if candidate.exists() and candidate.is_file():
+            log.info("Using custom Java: %s", candidate)
+            return candidate
+        log.warning(
+            "Custom Java path not found: %s – falling back to auto‑detection",
+            custom_java,
+        )
+
+    # 2. Bundled Java
+    base = Path(game_dir).resolve() / "java" / _os_name() / "bin"
     exe_names = ["javaw.exe", "java.exe"] if _is_windows() else ["java"]
 
     for name in exe_names:
         candidate = base / name
         if candidate.exists():
-            log.info(f"Found bundled Java: {candidate}")
+            log.info("Bundled Java: %s", candidate)
             return candidate
 
-    log.info("Bundled Java not found – falling back to system Java")
-
-    # System Java fallback
-    # 1. Check JAVA_HOME environment variable
+    # 3. JAVA_HOME environment variable
     java_home = os.environ.get("JAVA_HOME")
     if java_home:
         java_exe = Path(java_home) / "bin" / ("javaw.exe" if _is_windows() else "java")
         if java_exe.exists():
-            log.info(f"Found Java via JAVA_HOME: {java_exe}")
             return java_exe
 
-    # 2. Check PATH via shutil.which()
+    # 4. System PATH
     system_java = shutil.which("javaw.exe" if _is_windows() else "java")
     if system_java:
-        log.info(f"Found Java on PATH: {system_java}")
         return Path(system_java)
 
-    # 3. macOS specific: use /usr/libexec/java_home
+    # 5. macOS helper
     if platform.system() == "Darwin":
         try:
-            java_home_path = subprocess.check_output(
+            home = subprocess.check_output(
                 ["/usr/libexec/java_home"], text=True
             ).strip()
-            java_exe = Path(java_home_path) / "bin" / "java"
-            if java_exe.exists():
-                log.info(f"Found macOS Java via java_home: {java_exe}")
-                return java_exe
-        except Exception as e:
-            log.warning(f"Failed to run /usr/libexec/java_home: {e}")
+            exe = Path(home) / "bin" / "java"
+            if exe.exists():
+                return exe
+        except Exception:
+            pass
 
-    log.error("No Java found (neither bundled nor system)")
+    log.error("No Java found")
     return None
 
 
-# -----------------------------------------------------------------------------
-#  Fabric JAR locator
-# -----------------------------------------------------------------------------
-def find_fabric_jar(game_dir: str, mc_version: str) -> Path | None:
-    base = Path(game_dir).resolve()
-    log.debug(f"Searching Fabric JAR in: {base} (mc_version={mc_version})")
+# ── Fabric version ID resolution ──────────────────────────────────────────────
 
-    # 1. Standard Fabric installer location: versions/<mc_version>/*.jar
-    versions_dir = base / "versions" / mc_version
-    if versions_dir.is_dir():
-        jars = list(versions_dir.glob("*.jar"))
-        fabric_jars = [j for j in jars if "fabric" in j.name.lower()]
-        chosen = fabric_jars[0] if fabric_jars else (jars[0] if jars else None)
-        if chosen:
-            log.info(f"Found JAR in versions dir: {chosen}")
-            return chosen
+def find_fabric_version_id(game_dir: str, mc_ver: str) -> str | None:
+    """
+    Returns the Fabric-loader version directory name that matches mc_ver,
+    e.g. 'fabric-loader-0.16.9-1.21.1'.
+    Falls back to mc_ver itself if no Fabric profile exists yet.
+    """
+    versions_root = Path(game_dir).resolve() / "versions"
+    if not versions_root.is_dir():
+        return None
 
-    # 2. Legacy .fabric/remapped-jars search
-    for candidate in (base, base / mc_version):
-        for remap_dir in ("remapped-jars", "remappedJars"):
-            root = candidate / ".fabric" / remap_dir
-            if not root.is_dir():
-                continue
-            log.debug(f"Checking remap root: {root}")
-            direct = root / "client-intermediary.jar"
-            if direct.exists():
-                log.info(f"Found Fabric JAR: {direct}")
-                return direct
-            for child in root.iterdir():
-                jar = child / "client-intermediary.jar"
-                if jar.exists():
-                    log.info(f"Found Fabric JAR: {jar}")
-                    return jar
+    candidates = [
+        d
+        for d in versions_root.iterdir()
+        if d.is_dir()
+        and d.name.startswith("fabric-loader-")
+        and mc_ver in d.name
+    ]
+    if candidates:
+        candidates.sort(key=lambda d: d.name, reverse=True)
+        return candidates[0].name
 
-    log.error("Fabric JAR not found")
+    vanilla = versions_root / mc_ver
+    if vanilla.is_dir():
+        return mc_ver
+
     return None
 
 
-# -----------------------------------------------------------------------------
-#  Maven helper and file download
-# -----------------------------------------------------------------------------
-def maven_to_path(lib_name: str, base: Path) -> Path:
-    parts = lib_name.split(":")
-    if len(parts) < 3:
-        log.error(f"Invalid maven name: {lib_name}")
-        return base / "invalid"
-    group, artifact, version = parts[0], parts[1], parts[2]
-    classifier = f"-{parts[3]}" if len(parts) > 3 else ""
-    group_path = Path(*group.split("."))
-    filename = f"{artifact}-{version}{classifier}.jar"
-    return base / group_path / artifact / version / filename
+# ── Classpath builder ─────────────────────────────────────────────────────────
 
-
-def download_file(url: str, dest: Path) -> bool:
-    """Download a file to the specified path, creating directories as needed."""
-    try:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        log.info(f"Downloading: {url} -> {dest}")
-        with urllib.request.urlopen(url) as response, open(dest, "wb") as out_file:
-            out_file.write(response.read())
-        return True
-    except Exception as e:
-        log.error(f"Failed to download {url}: {e}")
-        return False
-
-
-# -----------------------------------------------------------------------------
-#  Classpath builder (with library downloading from Maven)
-# -----------------------------------------------------------------------------
-def _build_classpath(game_dir_path: Path, mc_version: str) -> list[str] | None:
-    """
-    Returns an ordered classpath list, or None if version JSON is missing.
-    Order: libraries → fabric loader JAR → vanilla game JAR
-    """
+def _build_classpath(
+    game_dir_path: Path, version_id: str, mc_ver: str
+) -> list[str] | None:
     classpath: list[str] = []
     lib_dir = game_dir_path / "libraries"
 
-    # ---- Libraries from version JSON ------------------------------------
-    version_json_path = game_dir_path / "versions" / mc_version / f"{mc_version}.json"
+    version_json_path = (
+        game_dir_path / "versions" / version_id / f"{version_id}.json"
+    )
     if not version_json_path.exists():
-        log.error(f"Missing version JSON: {version_json_path}")
+        log.error("Missing version JSON: %s", version_json_path)
         return None
 
-    with open(version_json_path, "r", encoding="utf-8") as f:
-        version_data = json.load(f)
+    version_data = json.loads(version_json_path.read_text(encoding="utf-8"))
 
-    libs = version_data.get("libraries", [])
-    log.info(f"Libraries declared in JSON: {len(libs)}")
+    # Fabric loader JSON inherits from the vanilla profile
+    inherits = version_data.get("inheritsFrom")
+    if inherits:
+        parent_path = game_dir_path / "versions" / inherits / f"{inherits}.json"
+        if parent_path.exists():
+            parent_data = json.loads(parent_path.read_text(encoding="utf-8"))
+            libs = parent_data.get("libraries", []) + version_data.get(
+                "libraries", []
+            )
+        else:
+            libs = version_data.get("libraries", [])
+    else:
+        libs = version_data.get("libraries", [])
 
+    log.info("Libraries to resolve: %d", len(libs))
+
+    seen: set[str] = set()
     for lib in libs:
         lib_file = None
         download_url = None
 
-        # 1. Try Mojang artifact info
+        # Path 1: standard Mojang/vanilla format — downloads.artifact block
         artifact = lib.get("downloads", {}).get("artifact", {})
         if artifact.get("path"):
             lib_file = lib_dir / artifact["path"]
-            download_url = artifact.get("url")
+            download_url = artifact.get("url") or None
 
-        # 2. Fallback to Maven coordinates
+        # Path 2: Fabric profile format — bare {"name": ..., "url": ...}
         if (not lib_file or not lib_file.exists()) and "name" in lib:
-            maven_path = maven_to_path(lib["name"], Path(""))
-            lib_file = lib_dir / maven_path
-
-            if not download_url:
-                # Convert Maven path to URL format
-                url_suffix = str(maven_path).replace("\\", "/")
-                for repo in MAVEN_REPOS:
-                    test_url = repo + url_suffix
-                    # We'll try to download from this URL
-                    download_url = test_url
-                    # Break after first candidate; actual download may still fail
-                    break
-
-        # Download missing library
-        if lib_file and not lib_file.exists():
-            if download_url:
-                log.info(f"Library missing, downloading: {lib.get('name')}")
-                success = download_file(download_url, lib_file)
-                if not success:
-                    log.warning(f"Could not download {lib.get('name')} from {download_url}")
+            lib_file = lib_dir / _maven_to_path(lib["name"])
+            url_suffix = str(_maven_to_path(lib["name"])).replace("\\", "/")
+            repo_base = lib.get("url", "").rstrip("/")
+            if repo_base:
+                download_url = f"{repo_base}/{url_suffix}"
             else:
-                log.warning(f"Missing lib {lib.get('name')} and no URL to download it.")
+                download_url = MAVEN_REPOS[0] + url_suffix
+
+        if lib_file and not lib_file.exists() and download_url:
+            log.info("Downloading library: %s", download_url)
+            _download_file(download_url, lib_file)
 
         if lib_file and lib_file.exists():
-            classpath.append(str(lib_file))
+            key = str(lib_file)
+            if key not in seen:
+                seen.add(key)
+                classpath.append(key)
+        elif lib_file:
+            log.warning(
+                "Library not found and could not be downloaded: %s", lib_file
+            )
 
-    # ---- Fabric loader JAR (contains KnotClient) -------------------------
-    fabric_jar = find_fabric_jar(str(game_dir_path), mc_version)
-    if fabric_jar:
-        if str(fabric_jar) not in classpath:
-            classpath.append(str(fabric_jar))
-            log.info(f"Appended Fabric loader JAR: {fabric_jar}")
-    else:
-        log.error("Fabric loader JAR NOT found — KnotClient will be missing!")
+    # Vanilla JAR
+    vanilla_jar = game_dir_path / "versions" / mc_ver / f"{mc_ver}.jar"
+    if vanilla_jar.exists() and str(vanilla_jar) not in seen:
+        classpath.append(str(vanilla_jar))
 
-    # ---- Vanilla game JAR (must be last) ---------------------------------
-    vanilla_jar = game_dir_path / "versions" / mc_version / f"{mc_version}.jar"
-    if vanilla_jar.exists():
-        if str(vanilla_jar) not in classpath:
-            classpath.append(str(vanilla_jar))
-            log.info(f"Appended vanilla JAR: {vanilla_jar}")
-    else:
-        log.warning(f"Vanilla JAR not found at: {vanilla_jar} (may be fine if Fabric replaces it)")
-
-    log.info(f"Classpath contains {len(classpath)} entries")
+    log.info("Classpath: %d entries", len(classpath))
     return classpath
 
 
-# -----------------------------------------------------------------------------
-#  Launch command builder
-# -----------------------------------------------------------------------------
+# ── Maven / download helpers ──────────────────────────────────────────────────
+
+def _maven_to_path(lib_name: str) -> Path:
+    parts = lib_name.split(":")
+    if len(parts) < 3:
+        return Path("invalid") / lib_name
+    group, artifact, version = parts[0], parts[1], parts[2]
+    classifier = f"-{parts[3]}" if len(parts) > 3 else ""
+    filename = f"{artifact}-{version}{classifier}.jar"
+    return Path(*group.split(".")) / artifact / version / filename
+
+
+def _download_file(url: str, dest: Path) -> bool:
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        req = urllib.request.Request(url, headers={"User-Agent": "DWP-Launcher/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as r, open(dest, "wb") as f:
+            f.write(r.read())
+        return True
+    except Exception as exc:
+        log.error("DOWNLOAD FAILED: %s", url)
+        log.exception(exc)          # This prints the full stack trace
+        return False
+
+
+# ── Launch command ────────────────────────────────────────────────────────────
+
 def build_launch_command(
     game_dir: str,
-    mc_version: str,
+    mc_ver: str,
     jvm_mb: int = 2048,
     username: str = "Player",
     access_token: str = "0",
     uuid: str = "00000000-0000-0000-0000-000000000000",
+    custom_java: str | None = None,          # <-- new
 ) -> list[str] | None:
 
-    java = find_java(game_dir)
+    java = find_java(game_dir, custom_java)   # <-- pass custom path
     if java is None:
-        log.error("Aborting: Java not found")
+        log.error("Java not found")
         return None
 
     game_dir_path = Path(game_dir).resolve()
-
-    classpath = _build_classpath(game_dir_path, mc_version)
-    if classpath is None:
+    version_id = find_fabric_version_id(game_dir, mc_ver)
+    if version_id is None:
+        log.error("No installed Fabric/MC version found for %s", mc_ver)
         return None
+
+    log.info("Using version profile: %s", version_id)
+    classpath = _build_classpath(game_dir_path, version_id, mc_ver)
     if not classpath:
-        log.error("Classpath is empty — aborting")
         return None
 
-    cp_string = os.pathsep.join(classpath)
+    cp_str = os.pathsep.join(classpath)
+
+    # Determine main class – Fabric uses KnotClient; pure vanilla uses its own
+    version_json = (
+        game_dir_path / "versions" / version_id / f"{version_id}.json"
+    )
+    main_class = MAIN_CLASS
+    if version_json.exists():
+        vdata = json.loads(version_json.read_text())
+        main_class = vdata.get("mainClass", MAIN_CLASS)
 
     cmd = [
         str(java),
         f"-Xmx{jvm_mb}M",
         f"-Xms{max(512, jvm_mb // 4)}M",
         "-XX:+UseG1GC",
-        "-Djava.library.path=" + str(game_dir_path / "natives"),
-        "-cp", cp_string,
-        MAIN_CLASS,
-        "--gameDir",   str(game_dir_path),
-        "--assetsDir", str(game_dir_path / "assets"),
-        "--assetIndex", mc_version,
-        "--version",   mc_version,
-        "--username",  username,
-        "--uuid",      uuid,
-        "--accessToken", access_token,
-        "--userType",  "msa" if access_token != "0" else "legacy",
+        f"-Djava.library.path={game_dir_path / 'natives'}",
+        "-cp",
+        cp_str,
+        main_class,
+        "--gameDir",
+        str(game_dir_path),
+        "--assetsDir",
+        str(game_dir_path / "assets"),
+        "--assetIndex",
+        _asset_index_id(game_dir_path, version_id, mc_ver),
+        "--version",
+        version_id,
+        "--username",
+        username,
+        "--uuid",
+        uuid,
+        "--accessToken",
+        access_token,
+        "--userType",
+        "msa" if access_token != "0" else "legacy",
     ]
 
-    if platform.system() == "Darwin":   # macOS
-        cmd.append("-XstartOnFirstThread")
-
-    log.debug("Launch command:")
-    for part in cmd:
-        log.debug(f"  {part}")
+    if platform.system() == "Darwin":
+        cmd.insert(1, "-XstartOnFirstThread")
 
     return cmd
 
 
-# -----------------------------------------------------------------------------
-#  Public launch function
-# -----------------------------------------------------------------------------
+def _asset_index_id(game_dir_path: Path, version_id: str, mc_ver: str) -> str:
+    """Read assetIndex.id from the version JSON; fall back to mc_ver."""
+    for vid in (version_id, mc_ver):
+        vj = game_dir_path / "versions" / vid / f"{vid}.json"
+        if vj.exists():
+            try:
+                data = json.loads(vj.read_text())
+                aid = data.get("assetIndex", {}).get("id")
+                if aid:
+                    return aid
+            except Exception:
+                pass
+    return mc_ver
+
+def find_all_java_installations(game_dir: str) -> list[Path]:
+    """
+    Return a list of all Java executables we can discover on the system,
+    without duplicates.  The order is:
+      - Bundled Java (game_dir/java/<os>/bin/)
+      - JAVA_HOME
+      - System PATH (via shutil.which)
+      - macOS helper (/usr/libexec/java_home -V)
+    """
+    candidates: list[Path] = []
+
+    # 1. Bundled
+    base = Path(game_dir).resolve() / "java" / _os_name() / "bin"
+    exe_names = ["javaw.exe", "java.exe"] if _is_windows() else ["java"]
+    for name in exe_names:
+        p = base / name
+        if p.is_file() and p not in candidates:
+            candidates.append(p)
+
+    # 2. JAVA_HOME
+    java_home = os.environ.get("JAVA_HOME")
+    if java_home:
+        exe = Path(java_home) / "bin" / ("javaw.exe" if _is_windows() else "java")
+        if exe.is_file() and exe not in candidates:
+            candidates.append(exe)
+
+    # 3. System PATH – sometimes there are multiple (but shutil.which only returns one)
+    system_java = shutil.which("javaw.exe" if _is_windows() else "java")
+    if system_java:
+        p = Path(system_java)
+        if p.is_file() and p not in candidates:
+            candidates.append(p)
+
+    # 4. macOS – /usr/libexec/java_home -V lists all installed JVMs
+    if platform.system() == "Darwin":
+        try:
+            output = subprocess.check_output(
+                ["/usr/libexec/java_home", "-V"], stderr=subprocess.STDOUT, text=True
+            )
+            # Lines look like: "    17.0.1 (x86_64) \"Oracle Corporation\" ...
+            import re
+            for line in output.splitlines():
+                # Extract path inside quotes after the version info
+                match = re.search(r'"([^"]+)"', line)
+                if match:
+                    jvm_path = Path(match.group(1)) / "bin" / "java"
+                    if jvm_path.is_file() and jvm_path not in candidates:
+                        candidates.append(jvm_path)
+        except Exception:
+            pass
+
+    # 5. Common locations on Linux (quick scan, no recursion)
+    if platform.system() == "Linux":
+        for root_dir in (Path("/usr/lib/jvm"), Path("/usr/java")):
+            if root_dir.is_dir():
+                for jdk_dir in root_dir.iterdir():
+                    exe = jdk_dir / "bin" / "java"
+                    if exe.is_file() and exe not in candidates:
+                        candidates.append(exe)
+
+    # 6. Windows – common install dirs
+    if _is_windows():
+        for base_dir in (
+            Path("C:/Program Files/Java"),
+            Path("C:/Program Files (x86)/Java"),
+        ):
+            if base_dir.is_dir():
+                for jdk_dir in base_dir.iterdir():
+                    for exe_name in ("javaw.exe", "java.exe"):
+                        exe = jdk_dir / "bin" / exe_name
+                        if exe.is_file() and exe not in candidates:
+                            candidates.append(exe)
+
+    return candidates
+
+# ── Public launch function ────────────────────────────────────────────────────
+
 def launch(
     game_dir: str,
-    mc_version: str,
+    mc_ver: str,
     jvm_mb: int = 2048,
     username: str = "Player",
     access_token: str = "0",
     uuid: str = "00000000-0000-0000-0000-000000000000",
+    custom_java: str | None = None,          # <-- new
 ) -> tuple[str | None, subprocess.Popen | None]:
     """
     Launch the game in a detached process.
     Returns (None, process) on success, or (error_string, None) on failure.
     """
-    cmd = build_launch_command(game_dir, mc_version, jvm_mb, username, access_token, uuid)
+    cmd = build_launch_command(
+        game_dir, mc_ver, jvm_mb, username, access_token, uuid, custom_java
+    )
     if cmd is None:
-        if find_java(game_dir) is None:
-            return "Java not found (bundled or system). Please install Java 17+ or place bundled Java in game_dir/java/<os>/bin/", None
-        return f"Could not build launch command for {mc_version} — check logs.", None
+        if find_java(game_dir, custom_java) is None:
+            return (
+                "Java not found. Please install Java 21+ or place bundled Java "
+                "in game_dir/java/<os>/bin/",
+                None,
+            )
+        return (
+            f"Could not build launch command for {mc_ver} — check logs.",
+            None,
+        )
 
-    # Detach the process (platform-specific)
     kwargs: dict = {}
-    if platform.system() == "Windows":
+    if _is_windows():
         kwargs["creationflags"] = (
             subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
         )
@@ -354,5 +448,5 @@ def launch(
             **kwargs,
         )
 
-    log.info(f"Game launched (PID={process.pid}). Output → {log_path}")
+    log.info("Game launched (PID=%d). Output → %s", process.pid, log_path)
     return None, process

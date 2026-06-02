@@ -5,22 +5,18 @@ Enabled:  <name>.jar
 Disabled: <name>.jar.disabled
 Tries to read fabric.mod.json inside each JAR for human-readable name/icon.
 """
-
 import json
 import os
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-
 try:
     from PIL import Image
     import io
     _PIL = True
 except ImportError:
     _PIL = False
-
-
 @dataclass
 class Mod:
     filename: str       # e.g. "sodium-0.5.jar"
@@ -29,8 +25,6 @@ class Mod:
     version:  str = ""
     description: str = ""
     icon_data: Optional[bytes] = field(default=None, repr=False)  # raw PNG bytes
-
-
 def _read_mod_meta(jar_path: Path) -> dict:
     """Extract fabric.mod.json from the JAR."""
     try:
@@ -40,8 +34,6 @@ def _read_mod_meta(jar_path: Path) -> dict:
     except Exception:
         pass
     return {}
-
-
 def _read_icon(jar_path: Path, meta: dict) -> Optional[bytes]:
     if not _PIL:
         return None
@@ -59,8 +51,6 @@ def _read_icon(jar_path: Path, meta: dict) -> Optional[bytes]:
     except Exception:
         pass
     return None
-
-
 def list_mods(game_dir: str) -> list:
     mods_dir = Path(game_dir) / "mods"
     if not mods_dir.is_dir():
@@ -90,8 +80,6 @@ def list_mods(game_dir: str) -> list:
             icon_data=icon,
         ))
     return mods
-
-
 def toggle_mod(game_dir: str, filename: str) -> bool:
     """Toggle a mod on/off. Returns new enabled state."""
     mods_dir = Path(game_dir) / "mods"
@@ -105,8 +93,6 @@ def toggle_mod(game_dir: str, filename: str) -> bool:
         path.rename(new_path)
         return False
     return False
-
-
 def open_mods_folder(game_dir: str):
     """Open the mods folder in the OS file manager."""
     import subprocess
@@ -120,8 +106,6 @@ def open_mods_folder(game_dir: str):
         subprocess.Popen(["open", folder])
     else:
         subprocess.Popen(["xdg-open", folder])
-
-
 def open_folder(game_dir: str, subfolder: str):
     """Open any subfolder in the OS file manager."""
     import subprocess

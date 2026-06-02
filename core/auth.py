@@ -30,89 +30,61 @@ def _format_uuid(raw: str) -> str:
 
 def _exchange_code_for_profile(auth_code: str, redirect_uri: str):
     """
-    Takes a Microsoft Live auth-code, walks the full auth chain, and
-    returns the same dict the old login_microsoft() returned.
+    Takes an auth code from aristois and exchanges it for a Minecraft profile.
+    Uses the /token/{id} endpoint as per the API documentation.
+    
+    Expected response format:
+    {
+        'status': 'success',
+        'message': 'Token has been invalidated',
+        'uuid': 'ed677adf-c1e2-4b43-a28f-a680e915424e',
+        'username': 'Raderth'
+    }
     """
-    # 1. Exchange code → MS access token via aristois proxy
-    r = requests.post(
-        f"{AUTH_BASE}/token",
-        data={
-            "client_id":    MSA_CLIENT_ID,
-            "code":         auth_code,
-            "redirect_uri": redirect_uri,
-            "grant_type":   "authorization_code",
-        },
-        timeout=15,
-    )
-    token_data = r.json()
-    ms_token = token_data.get("access_token")
-    if not ms_token:
-        print("Token exchange failed:", token_data)
-        return None
-
-    # 2. Xbox Live
-    xbl = requests.post(
-        "https://user.auth.xboxlive.com/user/authenticate",
-        json={
-            "Properties": {
-                "AuthMethod": "RPS",
-                "SiteName":  "user.auth.xboxlive.com",
-                "RpsTicket": f"d={ms_token}",
-            },
-            "RelyingParty": "http://auth.xboxlive.com",
-            "TokenType": "JWT",
-        },
-        timeout=15,
-    ).json()
-    xbl_token = xbl.get("Token")
-    uhs = xbl.get("DisplayClaims", {}).get("xui", [{}])[0].get("uhs")
-    if not xbl_token or not uhs:
-        print("XBL failed:", xbl)
-        return None
-
-    # 3. XSTS
-    xsts = requests.post(
-        "https://xsts.auth.xboxlive.com/xsts/authorize",
-        json={
-            "Properties": {
-                "SandboxId":  "RETAIL",
-                "UserTokens": [xbl_token],
-            },
-            "RelyingParty": "rp://api.minecraftservices.com/",
-            "TokenType": "JWT",
-        },
-        timeout=15,
-    ).json()
-    xsts_token = xsts.get("Token")
-    if not xsts_token:
-        print("XSTS failed:", xsts)
-        return None
-
-    # 4. Minecraft
-    mc = requests.post(
-        "https://api.minecraftservices.com/authentication/login_with_xbox",
-        json={"identityToken": f"XBL3.0 x={uhs};{xsts_token}"},
-        timeout=15,
-    ).json()
-    mc_token = mc.get("access_token")
-    if not mc_token:
-        print("MC auth failed:", mc)
-        return None
-
-    # 5. Profile
-    profile = requests.get(
-        "https://api.minecraftservices.com/minecraft/profile",
-        headers={"Authorization": f"Bearer {mc_token}"},
-        timeout=15,
-    ).json()
-    if "id" not in profile:
-        print("Profile failed:", profile)
-        return None
-
+    # Exchange code via aristois token endpoint
+    try:
+        token_url = f"{AUTH_BASE}/token/{auth_code}"
+        print(f"[AUTH] Fetching profile from {token_url}")
+        r = requests.get(token_url, timeout=15)
+        r.raise_for_status()
+        token_data = r.json()
+        print(f"[AUTH] Response status: {token_data.get('status')}")
+        print(f"[AUTH] Response data: {token_data}")
+    except requests.exceptions.HTTPError as e:
+        print(f"[AUTH] HTTP error: {e.response.status_code} - {e.response.text}")
+        raise ValueError(f"Token lookup failed: HTTP {e.response.status_code}")
+    except Exception as e:
+        print(f"[AUTH] Error: {type(e).__name__}: {str(e)}")
+        raise ValueError(f"Token lookup failed: {str(e)}")
+    
+    # Check if status is success (not 'ok')
+    status = token_data.get("status", "").lower()
+    if status != "success":
+        msg = token_data.get("message", "Token verification failed")
+        print(f"[AUTH] Failed with status '{status}': {msg}")
+        raise ValueError(f"Authentication failed: {msg}")
+    
+    # Extract profile data from response
+    username = token_data.get("username")
+    uuid = token_data.get("uuid")
+    
+    if not username or not uuid:
+        print(f"[AUTH] Missing username or uuid in response: {token_data}")
+        raise ValueError(f"Incomplete authentication response - missing username or uuid")
+    
+    # Format UUID if needed (should already have dashes but just in case)
+    if len(uuid.replace("-", "")) == 32:
+        uuid = _format_uuid(uuid.replace("-", ""))
+    
+    # Use the code/token as the access token for now
+    access_token = auth_code
+    
+    print(f"[AUTH] Successfully authenticated: {username} ({uuid})")
+    
     return {
-        "username":     profile["name"],
-        "uuid":         _format_uuid(profile["id"]),
-        "access_token": mc_token,
+        "username":     username,
+        "uuid":         uuid,
+        "access_token": access_token,
     }
 
 

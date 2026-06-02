@@ -1,24 +1,12 @@
 """
 ui/app.py  –  DWP Launcher using pywebview.
-
-Verify flow (all in system browser, no embedded webview navigation):
-  1. start_verify() generates a random session_id
-  2. Opens https://<domain>/verify?session=<id>  in the system browser
-     → user does Discord OAuth in browser
-     → browser shows "return to launcher" page
-  3. Simultaneously opens https://auth.aristois.net/auth  in a second browser tab
-  4. Shows the in-app code-entry popup
-  5. User pastes aristois code into popup → launcher POSTs to /verify/submit
-  6. on_verify_complete() fires on success
 """
-
 import base64
 import json
 import os
 import threading
 import sys
 import webbrowser
-import time
 import secrets
 import subprocess
 from pathlib import Path
@@ -27,38 +15,62 @@ import requests
 import webview
 
 from core import config, version
-from core.downloader import Downloader
+from core.installer import Installer
 from core.game_launcher import launch, find_java
 from core.mods import list_mods, toggle_mod, open_folder
-
+from core.auth import login_microsoft
 
 def _find_logo(game_dir: str) -> str:
-    search_names = [
-        "logo.png", "logo.jpg", "logo.gif", "logo.webp",
-        "icon.png", "icon.jpg", "dwp.png", "dwp.jpg",
-        "launcher_logo.png", "launcher_icon.png",
+    """Load logo.png and convert to data URI, or return empty string."""
+    possible_paths = [
+        Path(game_dir).parent / "logo.png",
+        Path("./logo.png"),
+        Path(__file__).parent.parent / "logo.png",
     ]
-    search_dirs = [
-        Path(game_dir),
-        Path(game_dir).parent,
-        Path(sys.argv[0]).parent if sys.argv[0] else Path("."),
-        Path("."),
-        Path(__file__).parent.parent,
-    ]
-    for d in search_dirs:
-        for name in search_names:
-            candidate = d / name
-            if candidate.exists():
-                try:
-                    ext  = candidate.suffix.lower().lstrip(".")
-                    mime = {"png": "image/png", "jpg": "image/jpeg",
-                            "jpeg": "image/jpeg", "gif": "image/gif",
-                            "webp": "image/webp"}.get(ext, "image/png")
-                    data = base64.b64encode(candidate.read_bytes()).decode()
-                    return f"data:{mime};base64,{data}"
-                except Exception:
-                    pass
+    
+    for logo_path in possible_paths:
+        if logo_path.exists():
+            try:
+                with open(logo_path, "rb") as f:
+                    data = base64.b64encode(f.read()).decode('utf-8')
+                print(f"Loaded logo from: {logo_path}")
+                return f"data:image/png;base64,{data}"
+            except Exception as e:
+                print(f"Failed to load logo from {logo_path}: {e}")
+                continue
+    
+    print("No logo.png found in expected locations")
     return ""
+
+def choose_java(self):
+    """Open a file dialog to pick a Java executable."""
+    import tkinter as tk
+    from tkinter import filedialog
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    filetypes = [
+        ("Java executable", "java*"),
+        ("All files", "*"),
+    ]
+    path = filedialog.askopenfilename(
+        title="Select Java Executable (java or javaw)",
+        filetypes=filetypes,
+    )
+    root.destroy()
+    if path:
+        self._cfg["java_path"] = path
+        config.save(self._cfg)
+        self._js(f'_onJavaPathChosen({json.dumps(path)})')
+    else:
+        self._js('_onJavaPathChosen("")')
+
+def clear_java_path(self):
+    """Remove custom Java and revert to auto-detection."""
+    self._cfg["java_path"] = None
+    config.save(self._cfg)
+    self._js('_onJavaPathCleared()')
+
 
 
 def _build_html(logo_data_uri: str) -> str:
@@ -102,25 +114,31 @@ def _build_html(logo_data_uri: str) -> str:
     font-family: 'Inter', sans-serif; font-size: 13px;
     overflow: hidden;
     user-select: none; -webkit-user-select: none;
-    -webkit-app-region: no-drag;
-    app-region: no-drag;
   }}
 
-  /* ── Drag strip (top 28px — contains only window controls, nothing else) ── */
   #drag-strip {{
     flex: 0 0 28px;
-    position: relative;
-    -webkit-app-region: drag;
-    app-region: drag;
-    background: transparent;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    padding: 2px 8px 0 0;
+    background: rgba(255,255,255,0.05);
     z-index: 200;
+    user-select: none;
+    -webkit-user-select: none;
+    cursor: grab;
+  }}
+  #drag-strip:active {{ cursor: grabbing; }}
+  #drag-area {{
+    flex: 1;
+    min-height: 28px;
+    cursor: inherit;
   }}
   #win-controls {{
-    position: absolute; right: 10px; top: 50%;
-    transform: translateY(-50%);
-    display: flex; gap: 4px;
-    -webkit-app-region: no-drag;
-    app-region: no-drag;
+    display: flex;
+    gap: 4px;
+    flex-shrink: 0;
+    cursor: default;
   }}
   .win-btn {{
     width: 24px; height: 18px;
@@ -132,18 +150,24 @@ def _build_html(logo_data_uri: str) -> str:
   .win-btn:hover {{ background: var(--bg4); color: var(--text2); }}
   #btn-close:hover {{ background: #c0293f; color: #fff; }}
 
-  /* ── Content ─────────────────────────────────────────────── */
-  #content {{ flex: 1; position: relative; overflow: hidden; }}
-
-  /* ── Pages ───────────────────────────────────────────────── */
+  /* ── Content & Pages ── */
+  #content {{
+    flex: 1;
+    position: relative;
+    display: flex;
+    overflow: hidden;
+    min-width: 0;
+  }}
   .page {{
     position: absolute; inset: 0;
     display: none;
-    height: 100%; width: 100%;
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
+    width: 100%;
   }}
   .page.active {{ display: flex; flex-direction: column; }}
 
-  /* ── PLAY ────────────────────────────────────────────────── */
+  /* ── PLAY ── */
   #page-play {{
     align-items: center; justify-content: center;
     background: var(--bg);
@@ -161,8 +185,6 @@ def _build_html(logo_data_uri: str) -> str:
     display: flex; flex-direction: column; align-items: center;
     padding-bottom: calc(var(--dock-h) + 24px);
   }}
-
-  /* Logo: ring is a ::before pseudo, image canvas sits above it */
   #logo-ring {{
     width: 120px; height: 120px;
     position: relative; margin-bottom: 20px; flex-shrink: 0;
@@ -176,7 +198,13 @@ def _build_html(logo_data_uri: str) -> str:
     font-family: 'Rajdhani', sans-serif; font-size: 28px; font-weight: 700;
     color: var(--text); z-index: 2;
   }}
-  #logo-img {{ display: none; }}
+  #logo-img {{ 
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    object-fit: contain;
+    z-index: 2;
+    border-radius: 50%;
+  }}
 
   #version-label {{ font-size: 11px; color: var(--text3); margin-bottom: 28px; }}
   #play-btn {{
@@ -205,8 +233,13 @@ def _build_html(logo_data_uri: str) -> str:
     max-width: 340px; text-align: center; min-height: 16px;
   }}
 
-  /* ── MODS ────────────────────────────────────────────────── */
-  #page-mods {{ background: var(--bg); position: relative; min-height: 100%;}}
+  /* ── MODS ── */
+  /* FIX: ensure mods page and its children stretch to full width */
+  #page-mods {{
+    background: var(--bg);
+    position: relative;
+    width: 100%;
+  }}
   #mods-glow {{
     position: absolute; bottom: -60px; left: -60px;
     width: 400px; height: 340px;
@@ -218,9 +251,11 @@ def _build_html(logo_data_uri: str) -> str:
     position: relative; z-index: 1;
     display: flex; flex-direction: column;
     padding: 16px; padding-bottom: calc(var(--dock-h) + 20px); gap: 12px;
-    height: 100%;
+    height: 100%; overflow-y: auto; flex: 1;
+    width: 100%;            /* FIX: fill horizontal space */
+    min-width: 0;           /* FIX: prevent flex blowout */
   }}
-  #mods-header {{ display: flex; align-items: center; justify-content: space-between; }}
+  #mods-header {{ display: flex; align-items: center; justify-content: space-between; width: 100%; }}
   #mods-header h2 {{
     font-family: 'Rajdhani', sans-serif; font-size: 18px;
     font-weight: 700; letter-spacing: 1px; color: var(--text);
@@ -234,15 +269,22 @@ def _build_html(logo_data_uri: str) -> str:
   }}
   .mods-action-btn:hover {{ color: var(--text); border-color: var(--text3); }}
   #mods-grid-wrap {{
-    flex: 1; background: rgba(20,20,20,0.85);
+    flex: 1;
+    width: 100%;            /* FIX: fill full width */
+    min-width: 0;           /* FIX: prevent overflow */
+    background: rgba(20,20,20,0.85);
     border: 1px solid var(--border); border-radius: 10px;
-    overflow-y: auto; padding: 14px; min-height: 0;
+    overflow-y: auto; padding: 14px;
+    min-height: 0;
   }}
   #mods-grid-wrap::-webkit-scrollbar {{ width: 5px; }}
   #mods-grid-wrap::-webkit-scrollbar-track {{ background: transparent; }}
   #mods-grid-wrap::-webkit-scrollbar-thumb {{ background: var(--bg4); border-radius: 3px; }}
   #mods-grid {{
-    display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 10px;
+    width: 100%;            /* FIX: fill grid container */
   }}
   .mod-card {{
     background: var(--bg3); border: 1px solid var(--border);
@@ -274,7 +316,7 @@ def _build_html(logo_data_uri: str) -> str:
   .mod-toggle.off::after {{ left: 2px; }}
   #mods-empty {{ padding: 40px; text-align: center; color: var(--text3); font-size: 12px; }}
 
-  /* ── SETTINGS ────────────────────────────────────────────── */
+  /* ── SETTINGS ── */
   #page-settings {{ background: var(--bg); overflow-y: auto; }}
   #page-settings::-webkit-scrollbar {{ width: 5px; }}
   #page-settings::-webkit-scrollbar-thumb {{ background: var(--bg4); border-radius: 3px; }}
@@ -322,9 +364,8 @@ def _build_html(logo_data_uri: str) -> str:
   .settings-btn.verified {{
     background: var(--green2); border: 1px solid var(--green); color: #fff; cursor: default;
   }}
-  #verify-status {{ font-size: 10px; color: var(--text3); padding: 0 4px; }}
 
-  /* ── Floating bubble dock ────────────────────────────────── */
+  /* ── Floating dock ── */
   #dock {{
     position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
     z-index: 100; display: flex; align-items: center; gap: 2px;
@@ -350,88 +391,62 @@ def _build_html(logo_data_uri: str) -> str:
     margin: 0 2px; flex-shrink: 0;
   }}
 
-  /* ── Verify code popup overlay ───────────────────────────── */
-  #verify-overlay {{
-    display: none;
-    position: fixed; inset: 0; z-index: 500;
-    background: rgba(0,0,0,0.7);
-    align-items: center; justify-content: center;
-    backdrop-filter: blur(4px);
-  }}
-  #verify-overlay.open {{ display: flex; }}
-  #verify-popup {{
-    width: 380px;
-    background: #111; border: 1px solid #2a2a2a; border-radius: 14px;
-    padding: 28px 26px; display: flex; flex-direction: column; gap: 16px;
-  }}
-  #verify-popup h3 {{
-    font-family: 'Rajdhani', sans-serif; font-size: 18px; font-weight: 700;
-    letter-spacing: 0.5px; color: var(--text);
-  }}
-  .popup-steps {{ display: flex; flex-direction: column; gap: 10px; }}
-  .popup-step {{
-    display: flex; gap: 10px; align-items: flex-start; font-size: 11px; color: #888;
-    line-height: 1.5;
-  }}
-  .step-dot {{
-    width: 18px; height: 18px; border-radius: 50%;
-    background: #1a1a1a; border: 1px solid #333;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 9px; font-weight: 700; color: #666; flex-shrink: 0; margin-top: 1px;
-  }}
-  .step-dot.done {{ background: #2d8a3a22; border-color: var(--green); color: var(--green); }}
-  #popup-code-row {{ display: flex; gap: 8px; }}
-  #popup-code-input {{
-    flex: 1; background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 7px;
-    color: var(--text); padding: 8px 12px;
-    font-family: 'Inter', sans-serif; font-size: 13px; outline: none;
-    transition: border-color 0.15s;
-  }}
-  #popup-code-input:focus {{ border-color: #555; }}
-  #popup-code-input::placeholder {{ color: #444; }}
-  #popup-submit {{
-    padding: 8px 16px; background: var(--crimson); border: 1px solid var(--crimson2);
-    border-radius: 7px; color: #fff;
-    font-family: 'Inter', sans-serif; font-size: 12px; font-weight: 600;
-    cursor: pointer; transition: background 0.15s; white-space: nowrap;
-  }}
-  #popup-submit:hover:not(:disabled) {{ background: var(--crimson2); }}
-  #popup-submit:disabled {{ opacity: 0.5; cursor: default; }}
-  #popup-cancel {{
-    background: none; border: none; color: var(--text3);
-    font-size: 11px; cursor: pointer; align-self: center;
-    padding: 4px 8px; transition: color 0.15s;
-  }}
-  #popup-cancel:hover {{ color: var(--text2); }}
-  #popup-msg {{ font-size: 11px; min-height: 14px; }}
-  #popup-msg.err {{ color: #c0293f; }}
-  #popup-msg.ok  {{ color: var(--green); }}
-
-  /* ── Toast ───────────────────────────────────────────────── */
+  /* ── Toast ── */
   #toast {{
     position: fixed; bottom: 84px; left: 50%;
     transform: translateX(-50%) translateY(10px);
     background: var(--bg3); border: 1px solid var(--border); border-radius: 8px;
     padding: 10px 20px; font-size: 12px; color: var(--text2);
     opacity: 0; pointer-events: none; transition: opacity 0.2s, transform 0.2s; z-index: 999;
+    -webkit-app-region: no-drag; app-region: no-drag;
   }}
   #toast.show {{ opacity: 1; transform: translateX(-50%) translateY(0); }}
+
+  #auth-overlay {{
+    display: none;
+    position: fixed; inset: 0; z-index: 500;
+    background: rgba(0,0,0,0.7);
+    align-items: center; justify-content: center;
+    backdrop-filter: blur(4px);
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
+  }}
+  #auth-overlay.open {{ display: flex; }}
+  #auth-popup {{
+    width: 380px;
+    background: #111; border: 1px solid #2a2a2a; border-radius: 14px;
+    padding: 28px 26px; display: flex; flex-direction: column;
+  }}
+  #auth-popup h3 {{
+    font-family: 'Rajdhani', sans-serif; font-size: 18px; font-weight: 700;
+    margin-bottom: 12px; color: var(--text);
+  }}
+  #auth-code-input {{
+    flex: 1; background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 7px;
+    color: var(--text); padding: 8px 12px;
+    font-family: 'Inter', sans-serif; font-size: 13px; outline: none;
+    margin-bottom: 4px;
+  }}
+  #auth-code-input:focus {{ border-color: #555; }}
+  #auth-popup-msg.err {{ color: #c0293f; }}
+  #auth-popup-msg.ok  {{ color: var(--green); }}
 </style>
 </head>
 <body>
 
-<!-- Drag strip + window controls -->
+<!-- Drag strip -->
 <div id="drag-strip">
+  <div id="drag-area"></div>
   <div id="win-controls">
-    <div class="win-btn" onclick="pyapi('minimize')">–</div>
+    <div class="win-btn" id="btn-min" onclick="pyapi('minimize')">–</div>
     <div class="win-btn" id="btn-close" onclick="pyapi('close')">✕</div>
   </div>
 </div>
 
-<!-- All pages -->
+<!-- Content -->
 <div id="content">
 
-  <!-- PLAY -->
+  <!-- PLAY page -->
   <div id="page-play" class="page active">
     <div id="play-glow"></div>
     <div id="play-inner">
@@ -449,7 +464,7 @@ def _build_html(logo_data_uri: str) -> str:
     </div>
   </div>
 
-  <!-- MODS -->
+  <!-- MODS page -->
   <div id="page-mods" class="page">
     <div id="mods-glow"></div>
     <div id="mods-content">
@@ -467,10 +482,9 @@ def _build_html(logo_data_uri: str) -> str:
     </div>
   </div>
 
-  <!-- SETTINGS -->
+  <!-- SETTINGS page -->
   <div id="page-settings" class="page">
     <div id="settings-inner">
-
       <div class="settings-section">
         <div class="settings-section-title">Performance</div>
         <div class="settings-row">
@@ -485,12 +499,53 @@ def _build_html(logo_data_uri: str) -> str:
       </div>
 
       <div class="settings-section">
+        <div class="settings-section-title">Java Runtime</div>
+        <div class="settings-row">
+          <div class="settings-label">Java Version</div>
+          <div class="settings-control" style="flex-wrap:wrap; gap:8px;">
+            <select id="java-select" class="settings-input" style="flex:1; min-width:200px;"
+                    onchange="onJavaSelectChange()">
+              <option value="__loading__">Detecting…</option>
+            </select>
+          </div>
+        </div>
+        <div id="custom-java-row" class="settings-row" style="display:none;">
+          <div class="settings-label">Custom Path</div>
+          <div class="settings-control" style="gap:8px;">
+            <input type="text" id="custom-java-input" class="settings-input"
+                   placeholder="Paste full path to javaw.exe / java">
+            <button class="settings-btn secondary" onclick="setCustomJava()">Set</button>
+          </div>
+        </div>
+        <div style="font-size:10px;color:var(--text3);padding-left:142px;">
+          Choose a specific Java installation or leave “Auto‑detect”.
+        </div>
+      </div>
+
+      <div class="settings-section">
         <div class="settings-section-title">Account</div>
         <div class="settings-row">
-          <div class="settings-label">Verify Account</div>
+          <div class="settings-label">Microsoft Login</div>
+          <!-- Auth code popup -->
+          <div id="auth-overlay">
+            <div id="auth-popup">
+              <h3>Microsoft Login</h3>
+              <p style="font-size:11px;color:#888;margin-bottom:12px;">
+                1. The browser has opened the Microsoft login page.<br>
+                2. Sign in and you'll receive a <strong>code</strong>.<br>
+                3. Paste that code below.
+              </p>
+              <input id="auth-code-input" type="text" placeholder="Paste code here…" autocomplete="off">
+              <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;">
+                <button class="settings-btn secondary" onclick="closeAuthPopup()">Cancel</button>
+                <button class="settings-btn" onclick="submitAuthCode()">Verify</button>
+              </div>
+              <div id="auth-popup-msg" style="font-size:11px;margin-top:8px;"></div>
+            </div>
+          </div>
           <div class="settings-control">
-            <button class="settings-btn secondary" id="verify-btn" onclick="doVerify()">Verify Ownership</button>
-            <span id="verify-status"></span>
+            <button class="settings-btn secondary" id="login-btn" onclick="doLogin()">Login with Microsoft</button>
+            <span id="login-status"></span>
           </div>
         </div>
         <div class="settings-row">
@@ -500,22 +555,6 @@ def _build_html(logo_data_uri: str) -> str:
               onclick="pyapi('open_url','https://minecraft.net/profile/skin')">
               Open Skin Manager
             </button>
-          </div>
-        </div>
-      </div>
-
-      <div class="settings-section">
-        <div class="settings-section-title">Server & URLs</div>
-        <div class="settings-row">
-          <div class="settings-label">Server URL</div>
-          <div class="settings-control">
-            <input class="settings-input" type="text" id="server-url-input">
-          </div>
-        </div>
-        <div class="settings-row">
-          <div class="settings-label">Download URL</div>
-          <div class="settings-control">
-            <input class="settings-input" type="text" id="download-url-input">
           </div>
         </div>
       </div>
@@ -537,11 +576,10 @@ def _build_html(logo_data_uri: str) -> str:
           <button class="settings-btn" onclick="saveSettings()">Save Settings</button>
         </div>
       </div>
-
     </div>
   </div>
 
-  <!-- Floating dock -->
+  <!-- Dock -->
   <div id="dock">
     <button class="dock-btn active" data-tab="play"     onclick="showTab('play')">Play</button>
     <div class="dock-sep"></div>
@@ -550,49 +588,53 @@ def _build_html(logo_data_uri: str) -> str:
     <button class="dock-btn"        data-tab="settings" onclick="showTab('settings')">Settings</button>
   </div>
 
-</div><!-- #content -->
-
-<!-- Verify code popup -->
-<div id="verify-overlay">
-  <div id="verify-popup">
-    <h3>Verify Minecraft Account</h3>
-    <div class="popup-steps">
-      <div class="popup-step">
-        <div class="step-dot done" id="step1-dot">✓</div>
-        <div>Your browser opened the Discord login — complete it there, then return here.</div>
-      </div>
-      <div class="popup-step">
-        <div class="step-dot" id="step2-dot">2</div>
-        <div>A second browser tab opened <strong>auth.aristois.net</strong>. Sign in with the Microsoft account that owns your Minecraft profile and copy the code shown.</div>
-      </div>
-      <div class="popup-step">
-        <div class="step-dot" id="step3-dot">3</div>
-        <div>Paste the aristois code below:</div>
-      </div>
-    </div>
-    <div id="popup-code-row">
-      <input id="popup-code-input" type="text" placeholder="Paste aristois code…"
-             autocomplete="off" spellcheck="false">
-      <button id="popup-submit" onclick="submitVerifyCode()">Verify</button>
-    </div>
-    <div id="popup-msg"></div>
-    <button id="popup-cancel" onclick="closeVerifyPopup()">Cancel</button>
-  </div>
 </div>
 
+<!-- Toast -->
 <div id="toast"></div>
 
 <script>
-// ── State ─────────────────────────────────────────────────────────────────────
-let btnState      = 'idle';
-let verifySession = null;   // current session_id during verify flow
+// ── Window drag: absolute-position approach ───────────────────────────────────
+let isDragging      = false;
+let winStartX       = 0;
+let winStartY       = 0;
+let mouseStartX     = 0;
+let mouseStartY     = 0;
+
+const dragStrip = document.getElementById('drag-strip');
+
+dragStrip.addEventListener('mousedown', async (e) => {{
+  if (e.target.closest('#win-controls')) return;
+  e.preventDefault();
+  isDragging = false;
+
+  const pos = await window.pywebview.api.get_window_pos();
+  winStartX   = pos.x;
+  winStartY   = pos.y;
+  mouseStartX = e.screenX;
+  mouseStartY = e.screenY;
+  isDragging  = true;
+  dragStrip.style.cursor = 'grabbing';
+}});
+
+document.addEventListener('mousemove', (e) => {{
+  if (!isDragging || !window.pywebview || !window.pywebview.api) return;
+  const newX = winStartX + (e.screenX - mouseStartX);
+  const newY = winStartY + (e.screenY - mouseStartY);
+  window.pywebview.api.move_window_abs(newX, newY);
+}});
+
+document.addEventListener('mouseup', () => {{
+  isDragging = false;
+  dragStrip.style.cursor = 'grab';
+}});
 
 // ── Tab switching ─────────────────────────────────────────────────────────────
 function showTab(tab) {{
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.dock-btn').forEach(b => b.classList.remove('active'));
   document.getElementById('page-' + tab).classList.add('active');
-  document.querySelector(`.dock-btn[data-tab="${{tab}}"]`).classList.add('active');
+  document.querySelector('.dock-btn[data-tab="' + tab + '"]').classList.add('active');
   if (tab === 'mods') refreshMods();
 }}
 
@@ -604,6 +646,8 @@ function pyapi(action, ...args) {{
 }}
 
 // ── Play ──────────────────────────────────────────────────────────────────────
+let btnState = 'idle';
+
 function onPlayClick() {{
   if (btnState === 'idle' || btnState === 'error') pyapi('start_download');
   else if (btnState === 'ready') {{
@@ -633,7 +677,10 @@ function setProgress(pct, mainLabel, subLabel) {{
 // ── Logo pixel-scan ───────────────────────────────────────────────────────────
 function renderLogo() {{
   const img = document.getElementById('logo-img');
+  const text = document.getElementById('logo-text');
   if (!img || !img.src || img.src === window.location.href) return;
+  img.style.display = 'block';
+  if (text) text.style.display = 'none';
   const SIZE = 120;
   const canvas = document.getElementById('logo-canvas');
   const ctx = canvas.getContext('2d');
@@ -653,8 +700,8 @@ function renderMods(mods) {{
     grid.innerHTML = '<div id="mods-empty">No mods found in mods/ folder.</div>';
     return;
   }}
-  grid.innerHTML = mods.map(mod => `
-    <div class="mod-card">
+  grid.innerHTML = mods.map(mod => 
+    `<div class="mod-card">
       <div class="mod-icon">
         ${{mod.icon_b64 ? `<img src="data:image/png;base64,${{mod.icon_b64}}" alt="">` : '🎮'}}
       </div>
@@ -664,8 +711,8 @@ function renderMods(mods) {{
       </div>
       <button class="mod-toggle ${{mod.enabled ? 'on' : 'off'}}"
               onclick="toggleMod('${{mod.filename}}')"></button>
-    </div>
-  `).join('');
+    </div>`
+  ).join('');
 }}
 function toggleMod(filename) {{
   const r = pyapi('toggle_mod', filename);
@@ -679,99 +726,138 @@ function updateMemLabel() {{
   document.getElementById('mem-label').textContent = (mb / 1024).toFixed(1) + ' GB';
 }}
 
-function doVerify() {{
-  const btn = document.getElementById('verify-btn');
-  btn.textContent = 'Opening…';
+async function doLogin() {{
+  const btn = document.getElementById('login-btn');
+  btn.textContent = 'Opening browser…';
   btn.disabled = true;
-  const r = pyapi('start_verify');
-  // Popup will open once Python confirms browsers opened
-  if (r && r.then) r.then(sessionId => {{
-    if (sessionId) openVerifyPopup(sessionId);
-    else {{ btn.textContent = 'Verify Ownership'; btn.disabled = false; }}
-  }});
+  const sessionId = await pyapi('start_auth');
+  if (sessionId) {{
+    openAuthPopup();
+  }} else {{
+    btn.textContent = 'Login with Microsoft';
+    btn.disabled = false;
+  }}
 }}
 
-// ── Verify popup ──────────────────────────────────────────────────────────────
-function openVerifyPopup(sessionId) {{
-  verifySession = sessionId;
-  document.getElementById('verify-overlay').classList.add('open');
-  document.getElementById('popup-code-input').value = '';
-  document.getElementById('popup-msg').textContent = '';
-  document.getElementById('popup-msg').className = '';
-  document.getElementById('popup-submit').disabled = false;
-  document.getElementById('popup-submit').textContent = 'Verify';
-  document.getElementById('popup-code-input').disabled = false;
-  setTimeout(() => document.getElementById('popup-code-input').focus(), 100);
+function openAuthPopup() {{
+  document.getElementById('auth-overlay').classList.add('open');
+  document.getElementById('auth-code-input').value = '';
+  document.getElementById('auth-popup-msg').textContent = '';
+  document.getElementById('auth-code-input').focus();
 }}
 
-function closeVerifyPopup() {{
-  document.getElementById('verify-overlay').classList.remove('open');
-  verifySession = null;
-  const btn = document.getElementById('verify-btn');
-  btn.textContent = 'Verify Ownership';
+function closeAuthPopup() {{
+  document.getElementById('auth-overlay').classList.remove('open');
+  const btn = document.getElementById('login-btn');
+  btn.textContent = 'Login with Microsoft';
   btn.disabled = false;
 }}
 
-async function submitVerifyCode() {{
-  const code = document.getElementById('popup-code-input').value.trim();
-  if (!code || !verifySession) return;
-
-  const submitBtn = document.getElementById('popup-submit');
-  const msg       = document.getElementById('popup-msg');
+async function submitAuthCode() {{
+  const code = document.getElementById('auth-code-input').value.trim();
+  if (!code) return;
+  const submitBtn = document.querySelector('#auth-popup .settings-btn:last-child');
   submitBtn.disabled = true;
   submitBtn.textContent = '…';
-  msg.className = '';
-  msg.textContent = 'Verifying…';
+  const msgEl = document.getElementById('auth-popup-msg');
+  msgEl.textContent = 'Exchanging…';
 
-  const r = pyapi('submit_verify_code', verifySession, code);
-  if (r && r.then) {{
-    r.then(result => {{
-      if (result && result.ok) {{
-        msg.className = 'ok';
-        msg.textContent = '✓ Verified as ' + result.username + '!';
-        submitBtn.textContent = 'Done';
-        document.getElementById('popup-code-input').disabled = true;
-        setTimeout(closeVerifyPopup, 1800);
-        onVerifyComplete(result.username);
-      }} else {{
-        msg.className = 'err';
-        msg.textContent = (result && result.error) || 'Verification failed.';
-        submitBtn.disabled = false;
-        submitBtn.textContent = 'Retry';
-      }}
-    }});
+  const result = await pyapi('exchange_auth_code', code);
+  if (result.ok) {{
+    msgEl.className = 'ok';
+    msgEl.textContent = 'Logged in as ' + result.username;
+    onLoginResult(result.username);
+    setTimeout(closeAuthPopup, 1500);
+  }} else {{
+    msgEl.className = 'err';
+    msgEl.textContent = result.error || 'Login failed.';
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Verify';
   }}
+}}
+
+function onLoginResult(username) {{
+  const btn = document.getElementById('login-btn');
+  btn.textContent = '✓ Logged in';
+  btn.classList.add('verified');
+  btn.disabled = true;
+  document.getElementById('login-status').textContent = username;
+}}
+
+function doVerifyRepair() {{ showTab('play'); pyapi('start_repair'); }}
+
+function saveSettings() {{
+  const memMb = parseInt(document.getElementById('mem-slider').value);
+  pyapi('save_settings', memMb);
+  toast('Settings saved.');
+}}
+
+// ── Java dropdown ────────────────────────────────────────────────────────────
+let javaOptions = [];
+
+function populateJavaDropdown(options) {{
+  javaOptions = options;
+  const sel = document.getElementById('java-select');
+  sel.innerHTML = '';
+  options.forEach(opt => {{
+    const el = document.createElement('option');
+    el.value = opt.path === null ? '__auto__' : opt.path;
+    el.textContent = opt.label;
+    sel.appendChild(el);
+  }});
+  // "Custom…" entry at the end
+  const customOpt = document.createElement('option');
+  customOpt.value = '__custom__';
+  customOpt.textContent = 'Custom…';
+  sel.appendChild(customOpt);
+
+  // Pre-select the saved path
+  const currentPath = (window._savedJavaPath || '');
+  if (currentPath && javaOptions.some(o => o.path === currentPath)) {{
+    sel.value = currentPath;
+  }} else if (currentPath) {{
+    sel.value = '__custom__';
+    showCustomJavaInput(currentPath);
+  }} else {{
+    sel.value = '__auto__';
+  }}
+  onJavaSelectChange();
+}}
+
+function onJavaSelectChange() {{
+  const sel = document.getElementById('java-select');
+  const customRow = document.getElementById('custom-java-row');
+  if (sel.value === '__custom__') {{
+    customRow.style.display = 'flex';
+    document.getElementById('custom-java-input').value = '';
+  }} else {{
+    customRow.style.display = 'none';
+    const path = sel.value === '__auto__' ? null : sel.value;
+    pyapi('set_java_path', path);
+  }}
+}}
+
+function setCustomJava() {{
+  const path = document.getElementById('custom-java-input').value.trim();
+  if (path) {{
+    pyapi('set_java_path', path);
+    toast('Custom Java path saved.');
+  }}
+}}
+
+function showCustomJavaInput(path) {{
+  document.getElementById('custom-java-row').style.display = 'flex';
+  document.getElementById('custom-java-input').value = path;
 }}
 
 document.addEventListener('keydown', e => {{
-  if (e.key === 'Escape') closeVerifyPopup();
-  if (e.key === 'Enter' &&
-      document.getElementById('verify-overlay').classList.contains('open')) {{
-    submitVerifyCode();
+  if (e.key === 'Escape' && document.getElementById('auth-overlay').classList.contains('open')) {{
+    closeAuthPopup();
+  }}
+  if (e.key === 'Enter' && document.getElementById('auth-overlay').classList.contains('open')) {{
+    submitAuthCode();
   }}
 }});
-
-function onVerifyComplete(username) {{
-  const btn = document.getElementById('verify-btn');
-  btn.textContent = '✓ Verified';
-  btn.classList.add('verified');
-  btn.disabled = true;
-  document.getElementById('verify-status').textContent = username;
-  toast('Account verified as ' + username + '!');
-}}
-
-// ── Repair ────────────────────────────────────────────────────────────────────
-function doVerifyRepair() {{ showTab('play'); pyapi('start_repair'); }}
-
-// ── Save settings ─────────────────────────────────────────────────────────────
-function saveSettings() {{
-  const serverUrl = document.getElementById('server-url-input').value.trim();
-  const downloadUrl = document.getElementById('download-url-input').value.trim();
-  const memMb     = parseInt(document.getElementById('mem-slider').value);
-  const r = pyapi('save_settings', serverUrl, downloadUrl, memMb);
-  if (r && r.then) r.then(() => toast('Settings saved.'));
-  else toast('Settings saved.');
-}}
 
 // ── Toast ─────────────────────────────────────────────────────────────────────
 function toast(msg) {{
@@ -781,29 +867,36 @@ function toast(msg) {{
   setTimeout(() => el.classList.remove('show'), 2800);
 }}
 
-// ── Init ──────────────────────────────────────────────────────────────────────
+// ── Init ─────────────────────────────────────────────────────────────────────
 function initUI(cfg) {{
   const totalMb   = cfg.total_ram_mb  || 8192;
   const currentMb = cfg.jvm_memory_mb || 2048;
   const slider = document.getElementById('mem-slider');
   slider.max = totalMb; slider.value = currentMb;
   document.getElementById('ram-hint').textContent =
-    `Total RAM: ${{(totalMb/1024).toFixed(1)}} GB`;
+    'Total RAM: ' + (totalMb/1024).toFixed(1) + ' GB';
   updateMemLabel();
-  document.getElementById('server-url-input').value = cfg.server_url || '';
-  document.getElementById('download-url-input').value = cfg.download_url || '';
   if (cfg.installed_ver)
     document.getElementById('installed-ver').textContent = 'Installed: ' + cfg.installed_ver;
-  if (cfg.verified) {{
-    const btn = document.getElementById('verify-btn');
-    btn.textContent = '✓ Verified';
-    btn.classList.add('verified');
-    btn.disabled = true;
-    if (cfg.active_account_name)
-      document.getElementById('verify-status').textContent = cfg.active_account_name;
+  if (cfg.logged_in) {{
+    onLoginResult(cfg.active_account_name);
   }}
+
+  // Store saved Java path (might be overridden by dropdown selection)
+  window._savedJavaPath = cfg.java_path || '';
+
+  // Fetch available Java installations and build the dropdown
+  if (window.pywebview && window.pywebview.api) {{
+    window.pywebview.api.get_java_list().then(opts => {{
+      populateJavaDropdown(opts);
+    }});
+  }}
+
   const img = document.getElementById('logo-img');
-  if (img) {{
+  if (img && img.src) {{
+    img.style.display = 'block';
+    const text = document.getElementById('logo-text');
+    if (text) text.style.display = 'none';
     if (img.complete) renderLogo();
     else img.onload = renderLogo;
   }}
@@ -812,15 +905,14 @@ function initUI(cfg) {{
 </body>
 </html>"""
 
-
 class API:
-    def __init__(self, window_ref_holder: list, cfg: dict, game_dir: str):
+    def __init__(self, window_ref_holder: list, cfg: dict, game_dir: str, remote_config_url: str):
         self._wh        = window_ref_holder
         self._cfg       = cfg
         self._game_dir  = game_dir
-        self._dl: Downloader | None = None
+        self._remote_url = remote_config_url
+        self._dl: Installer | None = None
         self._btn_state = "idle"
-
         self._process: subprocess.Popen | None = None
 
     @property
@@ -831,23 +923,47 @@ class API:
         if self._win:
             self._win.evaluate_js(code)
 
-    def _server_base(self) -> str:
-        url = self._cfg.get("server_url", "")
-        # Normalise to just scheme + host, e.g. https://playdwp.net
-        url = url.rstrip("/")
-        if not url.startswith("http"):
-            url = "https://" + url
-        # Strip any path after the host
-        from urllib.parse import urlparse
-        p = urlparse(url)
-        return f"{p.scheme}://{p.netloc}"
+    def start_auth(self) -> str:
+        """Opens the Microsoft login page on aristois.net."""
+        webbrowser.open("https://auth.aristois.net/auth")
+        return "active"
 
-    # ── Window ─────────────────────────────────────────────────────────────
+    def exchange_auth_code(self, code: str) -> dict:
+        """Directly exchange the aristois code for a profile."""
+        from core.auth import _exchange_code_for_profile
+        try:
+            profile = _exchange_code_for_profile(code, "https://auth.aristois.net/auth")
+            if profile:
+                self._cfg["active_account"] = {
+                    "username": profile["username"],
+                    "uuid": profile["uuid"],
+                    "access_token": profile["access_token"],
+                }
+                self._cfg["active_account_name"] = profile["username"]
+                config.save(self._cfg)
+                return {"ok": True, "username": profile["username"]}
+            else:
+                return {"ok": False, "error": "Code exchange failed."}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # Window controls
     def minimize(self):
         if self._win: self._win.minimize()
 
     def close(self):
         if self._win: self._win.destroy()
+
+    def get_window_pos(self) -> dict:
+        """Return the window's current screen position for the drag calculation."""
+        if self._win:
+            return {"x": self._win.x, "y": self._win.y}
+        return {"x": 0, "y": 0}
+
+    def move_window_abs(self, x: int, y: int):
+        """Move the window to an absolute screen position."""
+        if self._win:
+            self._win.move(int(x), int(y))
 
     def open_url(self, url: str):
         webbrowser.open(url)
@@ -855,19 +971,24 @@ class API:
     def open_folder(self, subfolder: str):
         open_folder(self._cfg["game_dir"], subfolder)
 
-    # ── Mods ───────────────────────────────────────────────────────────────
+    # Mods
     def get_mods(self):
-        mods = list_mods(self._cfg["game_dir"])
-        result = []
-        for m in mods:
-            icon_b64 = ""
-            if m.icon_data:
-                icon_b64 = base64.b64encode(m.icon_data).decode()
-            result.append({
-                "filename": m.filename, "enabled": m.enabled,
-                "name": m.name, "version": m.version, "icon_b64": icon_b64,
-            })
-        return result
+        """Return list of mods from the mods folder."""
+        try:
+            mods_list = list_mods(self._cfg["game_dir"])
+            result = []
+            for m in mods_list:
+                icon_b64 = ""
+                if m.icon_data:
+                    icon_b64 = base64.b64encode(m.icon_data).decode()
+                result.append({
+                    "filename": m.filename, "enabled": m.enabled,
+                    "name": m.name, "version": m.version, "icon_b64": icon_b64,
+                })
+            return result
+        except Exception as e:
+            print(f"[MODS] Error loading mods: {e}")
+            return []
 
     def toggle_mod(self, filename: str):
         try:
@@ -875,92 +996,47 @@ class API:
         except Exception as e:
             self._js(f"toast({json.dumps(str(e))})")
 
-    # ── Verify ─────────────────────────────────────────────────────────────
-    def start_verify(self) -> str | None:
-        """
-        Called from JS when the user clicks Verify Ownership.
-        1. Generates a session_id
-        2. Opens /verify?session=<id> in the system browser (Discord OAuth)
-        3. Opens https://auth.aristois.net/auth in a second browser tab
-        4. Returns the session_id so JS can open the popup
-        """
-        base = self._server_base()
-        if not base or base == "https://":
-            self._js("toast('Server URL not configured — cannot verify.')")
-            return None
+    # Login
+    def login(self):
+        def run():
+            try:
+                result = login_microsoft()
+                if result:
+                    self._cfg["active_account"] = {
+                        "username": result["username"],
+                        "uuid": result["uuid"],
+                        "access_token": result["access_token"],
+                    }
+                    self._cfg["active_account_name"] = result["username"]
+                    config.save(self._cfg)
+                    self._js(f"onLoginResult({json.dumps(result['username'])})")
+                else:
+                    self._js("toast('Login failed or cancelled.')")
+                    self._js("document.getElementById('login-btn').textContent = 'Login with Microsoft';")
+                    self._js("document.getElementById('login-btn').disabled = false;")
+            except Exception as e:
+                self._js(f"toast({json.dumps(str(e))})")
+                self._js("document.getElementById('login-btn').textContent = 'Login with Microsoft';")
+                self._js("document.getElementById('login-btn').disabled = false;")
+        threading.Thread(target=run, daemon=True).start()
 
-        session_id = secrets.token_hex(16)
-        verify_url = f"{base}/verify?session={session_id}"
-
-        webbrowser.open(verify_url)
-
-        return session_id   # JS receives this and opens the popup
-
-    def submit_verify_code(self, session_id: str, aristois_code: str) -> dict:
-        """
-        Called from JS when the user submits their aristois code in the popup.
-        POSTs to /verify/submit on the Flask server.
-        Returns { ok, username, uuid } or { error }.
-        """
-        base = self._server_base()
-        try:
-            r = requests.post(
-                f"{base}/verify/submit",
-                json={"session_id": session_id, "aristois_code": aristois_code},
-                timeout=20,
-            )
-            data = r.json()
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
-
-        if data.get("custom_token"):
-            self._cfg["mc_custom_token"]     = data["custom_token"]
-            self._cfg["active_account_name"] = data["username"]
-            self._cfg["active_account_uuid"] = data["uuid"]
-            config.save(self._cfg)
-            return {"ok": True, "username": data["username"], "uuid": data["uuid"]}
-
-        return {"ok": False, "error": data.get("error", "Unknown error")}
-
-    # ── Settings ───────────────────────────────────────────────────────────
-    def save_settings(self, server_url: str, download_url: str, mem_mb: int):
-        self._cfg["server_url"]    = server_url
-        self._cfg["download_url"]    = download_url
+    # Settings
+    def save_settings(self, mem_mb: int):
         self._cfg["jvm_memory_mb"] = int(mem_mb)
         config.save(self._cfg)
 
-    # ── Download / Repair ──────────────────────────────────────────────────
+    # Install / repair
     def start_download(self, repair_only: bool = False):
-        self._repair_active = repair_only
-        if self._btn_state in ("downloading", "verifying"):
-            return
-        mods_only = False
-        if not repair_only and version.is_mod_only_update(
-          self._cfg["game_dir"], self._cfg["download_url"]):
-            mods_only = True
-            self._js("setStatus('Checking for mod updates...')")
-        elif not repair_only and version.mc_version_changed(
-          self._cfg["game_dir"], self._cfg["download_url"]):
-            import shutil
-            mods_path = Path(self._cfg["game_dir"]) / "mods"
-            if mods_path.exists():
-                shutil.rmtree(mods_path)
-                self._js("setStatus('Removed outdated mods due to MC version change.')")
-
         self._btn_state = "downloading"
         self._js("setBtnState('downloading','DOWNLOADING','',0)")
 
-        self._dl = Downloader(
-            server_url  = self._cfg["server_url"],
-            download_url= self._cfg["download_url"],
-            game_dir    = self._cfg["game_dir"],
-            on_progress = self._on_progress,
-            on_status   = self._on_status,
-            on_phase    = self._on_phase,
-            on_done     = self._on_done,
-            on_error    = self._on_error,
-            repair_only = repair_only,
-                    mods_only   = mods_only,
+        self._dl = Installer(
+            game_dir=self._game_dir,
+            remote_config_url=self._remote_url,
+            on_progress=self._on_progress,
+            on_status=self._on_status,
+            on_done=self._on_done,
+            on_error=self._on_error,
         )
         threading.Thread(target=self._dl.run, daemon=True).start()
 
@@ -969,121 +1045,114 @@ class API:
 
     def _on_progress(self, done, total, bytes_done, bytes_total):
         pct = int((done / total * 100) if total else 0)
-        if self._btn_state == "verifying":
-            # Verify/repair passes file counts in both pairs, not bytes
-            self._js(f"setProgress({pct},'{"REPAIRING" if getattr(self,"_repair_active",False) else "VERIFYING"}','{done}/{total} files')")
-        elif self._btn_state == "downloading":
-            mb   = bytes_done  / 1_048_576
-            mb_t = bytes_total / 1_048_576
-            self._js(f"setProgress({pct},'DOWNLOADING','{pct}%  {mb:.0f}/{mb_t:.0f} MB')")
+        if self._btn_state == "downloading":
+            self._js(f"setProgress({pct},'DOWNLOADING','{done}/{total} files')")
+        elif self._btn_state == "verifying":
+            self._js(f"setProgress({pct},'VERIFYING','{done}/{total} files')")
 
     def _on_status(self, msg: str):
+        """Route status messages (including per-file download names) to the UI."""
         self._js(f"setStatus({json.dumps(msg)})")
 
-    def _on_phase(self, phase: str):
-        if phase == "downloading":
-            self._btn_state = "downloading"
-            self._js("setBtnState('downloading','DOWNLOADING','',0)")
-        elif phase == "verifying":
-            self._btn_state = "verifying"
-            self._js("setBtnState('verifying','VERIFYING','',0)")
-        elif phase == "done":
-            self._btn_state = "ready"
-            self._js("setBtnState('ready','PLAY','',100)")
-            self._js("setStatus('Ready to play!')")
-            ver = version.local_version(self._cfg["game_dir"])
-            if ver:
-                self._js(f"setVersion('Version: {ver.get('version', '?')}')")
-        elif phase == "verifying":
-          self._btn_state = "verifying"
-          label = "REPAIRING" if getattr(self, '_repair_active', False) else "VERIFYING"
-          self._js(f"setBtnState('verifying',{json.dumps(label)},'',0)")
-                
-        elif phase == "error":
-            self._btn_state = "error"
-            self._js("setBtnState('error','RETRY','',0)")
-
-    def _on_done(self): pass
-
-    def _on_error(self, msg: str):
-        self._js(f"toast({json.dumps(msg)})")
-
-    # ── Launch ─────────────────────────────────────────────────────────────
-    def launch_game(self):
-        ver    = version.local_version(self._cfg["game_dir"])
-        mc_ver = ver.get("mc_version") if ver else None
-
-        import re
-        dir_ver = Path(self._cfg["game_dir"]).name
-        if re.fullmatch(r"\d+(?:\.\d+)*", dir_ver):
-            mc_ver = dir_ver
-        if not mc_ver:
-            mc_ver = "26.1.2"
-
-        jvm_mb       = self._cfg.get("jvm_memory_mb") or config.default_jvm_mb()
-        account      = self._cfg.get("active_account")
-        custom_token = self._cfg.get("mc_custom_token")
-
-        if not account or isinstance(account, str):
-            if custom_token:
-                account = {
-                    "username":     self._cfg.get("active_account_name", "Player"),
-                    "uuid":         self._cfg.get("active_account_uuid", "00000000-0000-0000-0000-000000000000"),
-                    "access_token": custom_token,
-                }
-            else:
-                self._js("toast('Please verify your account first (Settings tab).')")
-                return
-
-        err, proc = launch(
-            game_dir     = self._cfg["game_dir"],
-            mc_version   = mc_ver,
-            jvm_mb       = jvm_mb,
-            username     = account["username"],
-            access_token = account["access_token"],
-            uuid         = account["uuid"],
-        )
-        if err:
-            self._js(f"toast({json.dumps(err)})")
-            self._js("setBtnState('ready','PLAY','',100)")
-            return
-        self._process = proc
-        self._js("setBtnState('running','STOP','Game running',100)")
-        threading.Thread(target=self._watch_process, daemon=True).start()
-
-    def _watch_process(self):
-        if self._process:
-            self._process.wait()          # blocks until game exits
-        self._process = None
+    def _on_done(self):
         self._btn_state = "ready"
         self._js("setBtnState('ready','PLAY','',100)")
-        self._js("setStatus('Game closed.')")
+        self._js("setStatus('Ready to play!')")
+        ver = version.local_version(self._game_dir)
+        if ver:
+            self._js(f"setVersion('Version: {ver.get('version', '?')}')")
+
+    def _on_error(self, msg: str):
+        self._btn_state = "error"
+        self._js(f"toast({json.dumps(msg)})")
+        self._js("setBtnState('error','RETRY','',0)")
+
+    def launch_game(self):
+        """Launch the Minecraft game."""
+        def run():
+            try:
+                account = self._cfg.get("active_account")
+                if not account:
+                    self._js("toast('No account logged in')")
+                    self._js("setBtnState('idle','PLAY','',0)")
+                    return
+                
+                print(f"[LAUNCH] Starting game for {account['username']}")
+                print(f"[LAUNCH] Game dir: {self._game_dir}")
+                
+                ver_info = version.local_version(self._game_dir)
+                mc_ver = ver_info.get("mc_version", "1.20") if ver_info else "1.20"
+                
+                custom_java = self._cfg.get("java_path")          # <-- NEW
+                
+                err, proc = launch(
+                    game_dir=self._game_dir,
+                    mc_ver=mc_ver,
+                    jvm_mb=self._cfg.get("jvm_memory_mb", 2048),
+                    username=account["username"],
+                    access_token=account["access_token"],
+                    uuid=account["uuid"],
+                    custom_java=custom_java,                     # <-- NEW
+                )
+                
+                if err:
+                    print(f"[LAUNCH] Error: {err}")
+                    self._js(f"toast({json.dumps(err)})")
+                    self._js("setBtnState('error','RETRY','',0)")
+                    return
+                
+                self._process = proc
+                print(f"[LAUNCH] Game launched with PID {proc.pid}")
+                self._js("setBtnState('running','STOP','running',100)")
+                self._watch_process()
+            except Exception as e:
+                print(f"[LAUNCH] Exception: {type(e).__name__}: {str(e)}")
+                self._js(f"toast({json.dumps(str(e))})")
+                self._js("setBtnState('error','RETRY','',0)")
+        
+        threading.Thread(target=run, daemon=True).start()
+
+    def _watch_process(self):
+        """Watch the game process and update UI when it closes."""
+        if not self._process:
+            return
+        print(f"[LAUNCH] Watching process {self._process.pid}")
+        try:
+            self._process.wait(timeout=300)
+            print(f"[LAUNCH] Game exited with code {self._process.returncode}")
+        except Exception as e:
+            print(f"[LAUNCH] Error watching process: {e}")
+        finally:
+            self._js("setBtnState('ready','PLAY','',100)")
+            self._js("setStatus('Game closed')")
+            self._process = None
 
     def stop_game(self):
+        """Stop the running game process."""
         if self._process:
             try:
+                print(f"[LAUNCH] Terminating process {self._process.pid}")
                 self._process.terminate()
-            except Exception:
-                pass
-    # ── Version check ───────────────────────────────────────────────────────
+                self._process.wait(timeout=5)
+            except Exception as e:
+                print(f"[LAUNCH] Error stopping process: {e}")
+                try:
+                    self._process.kill()
+                except:
+                    pass
+            finally:
+                self._process = None
+                self._js("setBtnState('ready','PLAY','',100)")
+
     def check_version(self):
         def work():
-            needs, local, remote = version.needs_update(
-                self._cfg["game_dir"], self._cfg["download_url"])
-            is_mod_only = False
-            if needs and version.is_mod_only_update(
-                    self._cfg["game_dir"], self._cfg["download_url"]):
-                is_mod_only = True
-            
+            needs, local, remote = version.needs_update(self._game_dir, self._remote_url)
             if local == "none":
                 label, state, lbl = f"Not installed  |  Server: {remote}", "idle", "DOWNLOAD"
-            elif is_mod_only:
-                label, state, lbl = f"Mods available for update", "idle", "UPDATE MODS"
             elif needs:
                 label, state, lbl = f"Update available  {local} → {remote}", "idle", "UPDATE"
             else:
                 label, state, lbl = f"Version: {local}", "ready", "PLAY"
-
             self._btn_state = state
             self._js(f"setVersion({json.dumps(label)})")
             if state == "ready":
@@ -1092,34 +1161,53 @@ class API:
                 self._js(f"setBtnState('idle',{json.dumps(lbl)},'',0)")
             if needs and local != "none":
                 self.start_download()
-
         threading.Thread(target=work, daemon=True).start()
 
 
-def run(server_url: str, game_dir: str):
+    def get_java_list(self) -> list[dict]:
+        """Return all discovered Java installations for the dropdown."""
+        from core.game_launcher import find_all_java_installations
+        paths = find_all_java_installations(self._cfg["game_dir"])
+        options = [{"label": "Auto-detect", "path": None}]
+        for p in paths:
+            options.append({"label": str(p), "path": str(p)})
+        # If a custom path is set and it's not already in the list, add it
+        custom = self._cfg.get("java_path")
+        if custom and not any(o["path"] == custom for o in options):
+            options.append({"label": f"Custom: {custom}", "path": custom})
+        return options
+
+    def set_java_path(self, path: str | None):
+        """Save the selected Java path (None for auto)."""
+        if path == "__auto__" or path is None or path == "":
+            self._cfg["java_path"] = None
+        else:
+            self._cfg["java_path"] = path
+        config.save(self._cfg)
+        self._js("toast('Java path updated.')")
+
+
+def run(remote_config_url: str, game_dir: str):
     cfg = config.load()
-    cfg["server_url"] = server_url
-    cfg["game_dir"]   = config.resolve_game_dir(game_dir)
+    cfg["game_dir"] = config.resolve_game_dir(game_dir)
     config.save(cfg)
 
     logo_data = _find_logo(cfg["game_dir"])
-    html      = _build_html(logo_data)
+    html = _build_html(logo_data)
 
     window_holder: list = []
-    api = API(window_holder, cfg, cfg["game_dir"])
+    api = API(window_holder, cfg, cfg["game_dir"], remote_config_url)
 
     def on_loaded():
-        ver     = version.local_version(cfg["game_dir"])
+        ver = version.local_version(cfg["game_dir"])
         ver_str = ver.get("version", "Not installed") if ver else "Not installed"
         init_data = {
-            "server_url":          cfg.get("server_url", ""),
-            "download_url":        cfg.get("download_url", ""),
             "jvm_memory_mb":       cfg.get("jvm_memory_mb") or config.default_jvm_mb(),
             "total_ram_mb":        config.get_total_ram_mb(),
             "active_account_name": cfg.get("active_account_name", ""),
-            "active_account_uuid": cfg.get("active_account_uuid", ""),
             "installed_ver":       ver_str,
-            "verified":            bool(cfg.get("mc_custom_token")),
+            "logged_in":           bool(cfg.get("active_account")),
+            "java_path":           cfg.get("java_path") or "",
         }
         window_holder[0].evaluate_js(f"initUI({json.dumps(init_data)})")
         api.check_version()
@@ -1132,7 +1220,7 @@ def run(server_url: str, game_dir: str):
         height           = 480,
         resizable        = True,
         frameless        = True,
-      easy_drag        = False,
+        easy_drag        = False,   # keep off — we handle drag ourselves
         background_color = "#0a0a0a",
     )
     window_holder.append(win)
