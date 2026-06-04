@@ -31,35 +31,32 @@ def _get_project_versions(slug: str, mc_version: str) -> list:
             raise ValueError(f"Modrinth API error for mod '{slug}': {str(e)}")
 
 def download_mod_from_modrinth(slug: str, mc_version: str, mods_dir: Path) -> str:
-    """Download the latest version for given MC version. Returns the filename."""
-    try:
-        print(f"[MODRINTH] Downloading mod: {slug} for MC {mc_version}")
-        versions = _get_project_versions(slug, mc_version)
-    except Exception as e:
-        raise ValueError(f"Failed to fetch versions for mod '{slug}': {str(e)}")
-    
-    if not versions:
-        raise ValueError(f"No Fabric version found for mod '{slug}' on Minecraft {mc_version}")
-    
-    # pick the latest (first from API)
-    ver = versions[0]
-    file_info = ver['files'][0]  # primary
-    filename = file_info['filename']
-    dest = mods_dir / filename
-    
-    if dest.exists():
-        print(f"[MODRINTH] Mod {slug} already exists at {dest}")
+    """
+    Temporary generic downloader.
+    """
+
+    mods_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Treat slug as direct URL if it looks like one ---
+    if slug.startswith("http://") or slug.startswith("https://"):
+        url = slug
+        filename = url.split("?")[0].split("/")[-1] or "downloaded_file"
+        dest = mods_dir / filename
+
+        if dest.exists():
+            return filename
+
+        print(f"[GENERIC] Downloading from {url}")
+
+        import requests
+        with requests.get(url, stream=True) as r:
+            r.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+
         return filename
-    
-    try:
-        download_url = file_info['url']
-        print(f"[MODRINTH] Downloading {filename} from {download_url}")
-        _download_file(download_url, dest, file_info['hashes'].get('sha1'))
-        print(f"[MODRINTH] Successfully downloaded {slug}")
-    except Exception as e:
-        raise ValueError(f"Failed to download mod '{slug}' ({filename}): {str(e)}")
-    
-    return filename
 
 def download_mod_from_curseforge(curseforge_url: str, mc_version: str, mods_dir: Path) -> str:
     # CurseForge requires an API key and is more complex; we provide a placeholder.
