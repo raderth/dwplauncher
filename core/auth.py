@@ -7,7 +7,7 @@ Output contract (unchanged):
 {
     "username":     str,
     "uuid":         str,   # with dashes
-    "access_token": str,   # raw Minecraft bearer token
+    "access_token": str,   # custom_token issued by Flask server
 }
 """
 
@@ -17,7 +17,6 @@ import time
 import requests
 from urllib.parse import urlencode
 
-# Must match the registered redirect URI in the aristois / Azure app
 MSA_CLIENT_ID = "b35593c4-f505-47e4-9a45-4f0d24c3c007"
 AUTH_BASE      = "https://auth.aristois.net"
 
@@ -28,84 +27,88 @@ def _format_uuid(raw: str) -> str:
     return raw
 
 
-def _exchange_code_for_profile(auth_code: str, redirect_uri: str):
+def _exchange_code_for_profile(aristois_code: str, session_id: str, server_domain: str):
     """
-    Takes an auth code from aristois and exchanges it for a Minecraft profile.
-    Uses the /token/{id} endpoint as per the API documentation.
-    
-    Expected response format:
+    Delegates the Aristois code exchange to the Flask server's /verify/submit
+    endpoint. The server validates the code, checks the whitelist, and returns
+    the custom_token which is used as the Minecraft access_token.
+
+    Expected response from /verify/submit:
     {
-        'status': 'success',
-        'message': 'Token has been invalidated',
-        'uuid': 'ed677adf-c1e2-4b43-a28f-a680e915424e',
-        'username': 'Raderth'
+        "custom_token": str,
+        "username":     str,
+        "uuid":         str,
     }
     """
-    # Exchange code via aristois token endpoint
+    submit_url = f"http://{server_domain}/verify/submit"
+    print(f"[AUTH] Submitting Aristois code to {submit_url}")
+
     try:
-        token_url = f"{AUTH_BASE}/token/{auth_code}"
-        print(f"[AUTH] Fetching profile from {token_url}")
-        r = requests.get(token_url, timeout=15)
+        r = requests.post(
+            submit_url,
+            json={
+                "session_id":    session_id,
+                "aristois_code": aristois_code,
+            },
+            timeout=15,
+        )
         r.raise_for_status()
-        token_data = r.json()
-        print(f"[AUTH] Response status: {token_data.get('status')}")
-        print(f"[AUTH] Response data: {token_data}")
+        data = r.json()
     except requests.exceptions.HTTPError as e:
-        print(f"[AUTH] HTTP error: {e.response.status_code} - {e.response.text}")
-        raise ValueError(f"Token lookup failed: HTTP {e.response.status_code}")
-    except Exception as e:
-        print(f"[AUTH] Error: {type(e).__name__}: {str(e)}")
-        raise ValueError(f"Token lookup failed: {str(e)}")
-    
-    # Check if status is success (not 'ok')
-    status = token_data.get("status", "").lower()
-    if status != "success":
-        msg = token_data.get("message", "Token verification failed")
-        print(f"[AUTH] Failed with status '{status}': {msg}")
+        body = {}
+        try:
+            body = e.response.json()
+        except Exception:
+            pass
+        msg = body.get("error", f"HTTP {e.response.status_code}")
+        print(f"[AUTH] /verify/submit error: {msg}")
         raise ValueError(f"Authentication failed: {msg}")
-    
-    # Extract profile data from response
-    username = token_data.get("username")
-    uuid = token_data.get("uuid")
-    
-    if not username or not uuid:
-        print(f"[AUTH] Missing username or uuid in response: {token_data}")
-        raise ValueError(f"Incomplete authentication response - missing username or uuid")
-    
-    # Format UUID if needed (should already have dashes but just in case)
-    if len(uuid.replace("-", "")) == 32:
-        uuid = _format_uuid(uuid.replace("-", ""))
-    
-    # Use the code/token as the access token for now
-    access_token = auth_code
-    
+    except Exception as e:
+        print(f"[AUTH] Error contacting server: {type(e).__name__}: {e}")
+        raise ValueError(f"Could not reach auth server: {e}")
+
+    custom_token = data.get("custom_token")
+    username     = data.get("username")
+    uuid         = data.get("uuid", "")
+
+    if not custom_token or not username:
+        raise ValueError("Incomplete response from auth server — missing token or username.")
+
+    # Normalise UUID format just in case
+    raw_uuid = uuid.replace("-", "")
+    if len(raw_uuid) == 32:
+        uuid = _format_uuid(raw_uuid)
+
     print(f"[AUTH] Successfully authenticated: {username} ({uuid})")
-    
+
     return {
         "username":     username,
         "uuid":         uuid,
-        "access_token": access_token,
+        "access_token": custom_token,   # custom_token from Flask server
     }
 
 
 def login_microsoft(domain: str = "localhost"):
     """
-    Opens the Microsoft Live OAuth page in the system browser, starts a
-    tiny local HTTP server to catch the redirect, then walks the full auth
-    chain.  Returns the same dict as the old implementation, or None on failure.
+    Opens the Aristois auth page in the system browser, starts a tiny local
+    HTTP server to catch the redirect code, then submits it to the Flask
+    server's /verify/submit endpoint.
 
-    In a pywebview launcher you should call this via the API bridge and let
-    the webview navigate to the Live URL directly so the callback lands in
-    /msa-callback on your Flask server instead of here.  This function is
-    kept as a fallback for CLI / non-webview use.
+    Returns the profile dict on success, or None on failure/timeout.
     """
     from http.server import BaseHTTPRequestHandler, HTTPServer
     from urllib.parse import urlparse, parse_qs
+    import secrets
 
     CALLBACK_PORT = 9876
     redirect_uri  = f"https://auth.aristois.net/auth"
 
-    result_holder: list = []
+    # Generate a session_id that matches an existing verify session on the
+    # Flask server. In the full launcher flow the session_id comes from
+    # /verify/poll; here we create one locally for CLI / fallback use.
+    session_id = secrets.token_hex(16)
+
+    result_holder: list = []   # will hold the aristois code
     stop_event = threading.Event()
 
     class _Handler(BaseHTTPRequestHandler):
@@ -124,7 +127,9 @@ def login_microsoft(domain: str = "localhost"):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html")
                 self.end_headers()
-                self.wfile.write(b"<html><body><h2>Login complete. You may close this tab.</h2></body></html>")
+                self.wfile.write(
+                    b"<html><body><h2>Login complete. You may close this tab.</h2></body></html>"
+                )
                 result_holder.append(code)
             else:
                 self.send_response(400)
@@ -153,4 +158,5 @@ def login_microsoft(domain: str = "localhost"):
         print("Login timed out or was cancelled.")
         return None
 
-    return _exchange_code_for_profile(result_holder[0], redirect_uri)
+    aristois_code = result_holder[0]
+    return _exchange_code_for_profile(aristois_code, session_id, domain)

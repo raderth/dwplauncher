@@ -31,6 +31,7 @@ MAVEN_REPOS = [
 ]
 
 MAIN_CLASS = "net.fabricmc.loader.impl.launch.knot.KnotClient"
+DEFAULT_JVM_MB = 2048
 
 
 # ── OS helpers ────────────────────────────────────────────────────────────────
@@ -233,7 +234,7 @@ def _download_file(url: str, dest: Path) -> bool:
         return True
     except Exception as exc:
         log.error("DOWNLOAD FAILED: %s", url)
-        log.exception(exc)          # This prints the full stack trace
+        log.exception(exc)
         return False
 
 
@@ -242,14 +243,19 @@ def _download_file(url: str, dest: Path) -> bool:
 def build_launch_command(
     game_dir: str,
     mc_ver: str,
-    jvm_mb: int = 2048,
+    jvm_mb: int = DEFAULT_JVM_MB,
     username: str = "Player",
     access_token: str = "0",
     uuid: str = "00000000-0000-0000-0000-000000000000",
-    custom_java: str | None = None,          # <-- new
+    custom_java: str | None = None,
 ) -> list[str] | None:
 
-    java = find_java(game_dir, custom_java)   # <-- pass custom path
+    # Guard against None being passed in for jvm_mb
+    if not isinstance(jvm_mb, int) or jvm_mb <= 0:
+        log.warning("Invalid jvm_mb value (%r), falling back to %d MB", jvm_mb, DEFAULT_JVM_MB)
+        jvm_mb = DEFAULT_JVM_MB
+
+    java = find_java(game_dir, custom_java)
     if java is None:
         log.error("Java not found")
         return None
@@ -362,10 +368,8 @@ def find_all_java_installations(game_dir: str) -> list[Path]:
             output = subprocess.check_output(
                 ["/usr/libexec/java_home", "-V"], stderr=subprocess.STDOUT, text=True
             )
-            # Lines look like: "    17.0.1 (x86_64) \"Oracle Corporation\" ...
             import re
             for line in output.splitlines():
-                # Extract path inside quotes after the version info
                 match = re.search(r'"([^"]+)"', line)
                 if match:
                     jvm_path = Path(match.group(1)) / "bin" / "java"
@@ -403,16 +407,21 @@ def find_all_java_installations(game_dir: str) -> list[Path]:
 def launch(
     game_dir: str,
     mc_ver: str,
-    jvm_mb: int = 2048,
+    jvm_mb: int = DEFAULT_JVM_MB,
     username: str = "Player",
     access_token: str = "0",
     uuid: str = "00000000-0000-0000-0000-000000000000",
-    custom_java: str | None = None,          # <-- new
+    custom_java: str | None = None,
 ) -> tuple[str | None, subprocess.Popen | None]:
     """
     Launch the game in a detached process.
     Returns (None, process) on success, or (error_string, None) on failure.
     """
+    # Guard against None being passed in for jvm_mb
+    if not isinstance(jvm_mb, int) or jvm_mb <= 0:
+        log.warning("Invalid jvm_mb value (%r), falling back to %d MB", jvm_mb, DEFAULT_JVM_MB)
+        jvm_mb = DEFAULT_JVM_MB
+
     cmd = build_launch_command(
         game_dir, mc_ver, jvm_mb, username, access_token, uuid, custom_java
     )

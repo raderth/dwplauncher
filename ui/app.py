@@ -122,7 +122,6 @@ def _build_html(logo_data_uri: str) -> str:
     justify-content: space-between;
     align-items: flex-start;
     padding: 2px 8px 0 0;
-    background: rgba(255,255,255,0.05);
     z-index: 200;
     user-select: none;
     -webkit-user-select: none;
@@ -924,23 +923,29 @@ class API:
             self._win.evaluate_js(code)
 
     def start_auth(self) -> str:
-        """Opens the Microsoft login page on aristois.net."""
-        webbrowser.open("https://auth.aristois.net/auth")
+        """Opens the verify flow on the Flask server."""
+        import secrets
+        self._pending_session_id = secrets.token_hex(16)
+        webbrowser.open(f"http://private.playdwp.net/verify?session={self._pending_session_id}")
         return "active"
 
     def exchange_auth_code(self, code: str) -> dict:
         """Directly exchange the aristois code for a profile."""
         from core.auth import _exchange_code_for_profile
         try:
-            profile = _exchange_code_for_profile(code, "https://auth.aristois.net/auth")
+            session_id = getattr(self, "_pending_session_id", None)
+            if not session_id:
+                return {"ok": False, "error": "No active session. Please restart login."}
+            profile = _exchange_code_for_profile(code, session_id, "private.playdwp.net")
             if profile:
                 self._cfg["active_account"] = {
                     "username": profile["username"],
-                    "uuid": profile["uuid"],
+                    "uuid":     profile["uuid"],
                     "access_token": profile["access_token"],
                 }
                 self._cfg["active_account_name"] = profile["username"]
                 config.save(self._cfg)
+                self._pending_session_id = None  # clear after use
                 return {"ok": True, "username": profile["username"]}
             else:
                 return {"ok": False, "error": "Code exchange failed."}
