@@ -185,12 +185,8 @@ class Installer:
                         print(f"[INSTALLER] Direct download: {direct_url}")
                         mod_tasks.append(('direct', direct_url, i))
                     elif modrinth_entry:
-                        if modrinth_entry.startswith('http') and ('cdn.modrinth.com' in modrinth_entry or modrinth_entry.endswith('.jar')):
-                            print(f"[INSTALLER] Direct download (via modrinth field): {modrinth_entry}")
-                            mod_tasks.append(('direct', modrinth_entry, i))
-                        else:
-                            print(f"[INSTALLER] Modrinth API download: {modrinth_entry}")
-                            mod_tasks.append(('modrinth', modrinth_entry, i))
+                        print(f"[INSTALLER] Direct download (via modrinth field): {modrinth_entry}")
+                        mod_tasks.append(('direct', modrinth_entry, i))
             
             total_mods = len(mod_tasks)
             completed = 0
