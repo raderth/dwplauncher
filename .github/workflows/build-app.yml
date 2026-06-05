@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-macos:
+  build-app:
     runs-on: macos-latest
 
     steps:
