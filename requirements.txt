@@ -1,3 +1,4 @@
 requests
 pywebview
 aiohttp
+pillow
