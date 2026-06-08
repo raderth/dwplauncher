@@ -118,4 +118,27 @@ def open_folder(game_dir: str, subfolder: str):
     elif system == "Darwin":
         subprocess.Popen(["open", folder])
     else:
-        subprocess.Popen(["xdg-open", folder])
+        # xdg-open can fail on bare WMs with no DBus file manager registered.
+        # Fall back through common file managers instead
+        file_managers = ["thunar", "nautilus", "dolphin", "nemo", "pcmanfm", "ranger"]
+        for fm in file_managers:
+            try:
+                result = subprocess.run(
+                    ["which", fm], capture_output=True, text=True
+                )
+                if result.returncode == 0: # which returns 0 if the file manager is installed
+                    subprocess.Popen([fm, folder])
+                    return
+            except Exception:
+                continue
+        # If no file managers found, use the appropriate terminal instead
+        for term in ["gnome-terminal", "alacritty", "kitty", "xterm", "foot"]:
+            try:
+                result = subprocess.run(
+                    ["which", term], capture_output=True, text=True
+                )
+                if result.returncode == 0:
+                    subprocess.Popen([term, "--working-directory", folder])
+                    return
+            except Exception:
+                continue
